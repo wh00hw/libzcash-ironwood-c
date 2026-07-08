@@ -156,7 +156,7 @@ static void test_note_commit_match_accepted(void) {
     build_synthetic_action(action, note_commit_rho, note_commit_expected_cmx);
 
     OrchardSignerError err = orchard_signer_feed_action_with_note(
-        &ctx, action, sizeof(action),
+        &ctx, ZIP244_POOL_ORCHARD, action, sizeof(action),
         note_commit_recipient, note_commit_value, note_commit_rseed);
     assert(err == SIGNER_OK);
     assert(ctx.actions_received == 1);
@@ -182,7 +182,7 @@ static void test_note_commit_attacker_recipient_rejected(void) {
     fake_recipient[0] ^= 0x01;
 
     OrchardSignerError err = orchard_signer_feed_action_with_note(
-        &ctx, action, sizeof(action),
+        &ctx, ZIP244_POOL_ORCHARD, action, sizeof(action),
         fake_recipient, note_commit_value, note_commit_rseed);
     assert(err == SIGNER_ERR_NOTE_COMMITMENT_MISMATCH);
     /* On rejection, ctx is reset to IDLE and the partial session is
@@ -202,7 +202,7 @@ static void test_note_commit_attacker_value_rejected(void) {
     build_synthetic_action(action, note_commit_rho, note_commit_expected_cmx);
 
     OrchardSignerError err = orchard_signer_feed_action_with_note(
-        &ctx, action, sizeof(action),
+        &ctx, ZIP244_POOL_ORCHARD, action, sizeof(action),
         note_commit_recipient, note_commit_value + 1, note_commit_rseed);
     assert(err == SIGNER_ERR_NOTE_COMMITMENT_MISMATCH);
     assert(ctx.state == SIGNER_IDLE);
@@ -220,7 +220,7 @@ static void test_note_commit_wrong_action_size_rejected(void) {
     /* Pass shorter action_len: must be SIGNER_ERR_BAD_ACTION before any
      * cmx work happens. */
     OrchardSignerError err = orchard_signer_feed_action_with_note(
-        &ctx, action, 819,
+        &ctx, ZIP244_POOL_ORCHARD, action, 819,
         note_commit_recipient, note_commit_value, note_commit_rseed);
     assert(err == SIGNER_ERR_BAD_ACTION);
     printf("  PASS: invalid action length rejected\n");
@@ -260,12 +260,12 @@ static int build_synthetic_action_v5(uint8_t out[820],
 
     /* cmx at offset 96 */
     orchard_compute_cmx(recipient, recipient + 11, value,
-                        out + 32, rseed, out + 96);
+                        out + 32, rseed, ORCHARD_NOTE_V2, out + 96);
 
     /* enc_ciphertext at offset 160, epk at offset 128 */
     return orchard_compute_enc_ciphertext_from_rseed(
         recipient, recipient + 11, value, rseed, out + 32, memo,
-        out + 160, out + 128);
+        ORCHARD_NOTE_V2, out + 160, out + 128);
 }
 
 /* A reusable memo fixture. */
@@ -287,7 +287,7 @@ static void test_memo_full_consistency_accepted(void) {
     assert(built == 0);
 
     OrchardSignerError err = orchard_signer_feed_action_with_note_and_memo(
-        &ctx, action, sizeof(action),
+        &ctx, ZIP244_POOL_ORCHARD, action, sizeof(action),
         note_commit_recipient, note_commit_value, note_commit_rseed,
         test_memo);
     assert(err == SIGNER_OK);
@@ -310,7 +310,7 @@ static void test_memo_captured_for_display(void) {
         action, note_commit_recipient, note_commit_value,
         note_commit_rseed, test_memo) == 0);
     assert(orchard_signer_feed_action_with_note_and_memo(
-        &ctx, action, sizeof(action),
+        &ctx, ZIP244_POOL_ORCHARD, action, sizeof(action),
         note_commit_recipient, note_commit_value, note_commit_rseed,
         test_memo) == SIGNER_OK);
 
@@ -339,7 +339,7 @@ static void test_memo_not_present_for_v4_feed(void) {
     uint8_t action[820];
     build_synthetic_action(action, note_commit_rho, note_commit_expected_cmx);
     assert(orchard_signer_feed_action_with_note(
-        &ctx, action, sizeof(action),
+        &ctx, ZIP244_POOL_ORCHARD, action, sizeof(action),
         note_commit_recipient, note_commit_value, note_commit_rseed) == SIGNER_OK);
 
     uint8_t memo_out[512];
@@ -369,7 +369,7 @@ static void test_memo_tampered_memo_rejected(void) {
     fake_memo[100] ^= 1;  /* flip one bit somewhere in the middle */
 
     OrchardSignerError err = orchard_signer_feed_action_with_note_and_memo(
-        &ctx, action, sizeof(action),
+        &ctx, ZIP244_POOL_ORCHARD, action, sizeof(action),
         note_commit_recipient, note_commit_value, note_commit_rseed,
         fake_memo);
     assert(err == SIGNER_ERR_MEMO_MISMATCH);
@@ -397,7 +397,7 @@ static void test_memo_tampered_rseed_rejected(void) {
     fake_rseed[0] ^= 1;
 
     OrchardSignerError err = orchard_signer_feed_action_with_note_and_memo(
-        &ctx, action, sizeof(action),
+        &ctx, ZIP244_POOL_ORCHARD, action, sizeof(action),
         note_commit_recipient, note_commit_value, fake_rseed,
         test_memo);
     /* Either NOTE_COMMITMENT_MISMATCH (cmx leg fires first) or
@@ -429,7 +429,7 @@ static void test_memo_tampered_enc_ciphertext_rejected(void) {
     action[360] ^= 1;
 
     OrchardSignerError err = orchard_signer_feed_action_with_note_and_memo(
-        &ctx, action, sizeof(action),
+        &ctx, ZIP244_POOL_ORCHARD, action, sizeof(action),
         note_commit_recipient, note_commit_value, note_commit_rseed,
         test_memo);
     assert(err == SIGNER_ERR_MEMO_MISMATCH);
@@ -464,7 +464,7 @@ static void test_verify_refuses_without_any_confirm(void) {
     uint8_t action[820];
     build_synthetic_action(action, note_commit_rho, note_commit_expected_cmx);
     OrchardSignerError err = orchard_signer_feed_action_with_note(
-        &ctx, action, sizeof(action),
+        &ctx, ZIP244_POOL_ORCHARD, action, sizeof(action),
         note_commit_recipient, note_commit_value, note_commit_rseed);
     assert(err == SIGNER_OK);
 
@@ -487,7 +487,7 @@ static void test_verify_accepts_after_confirm(void) {
     uint8_t action[820];
     build_synthetic_action(action, note_commit_rho, note_commit_expected_cmx);
     assert(orchard_signer_feed_action_with_note(
-        &ctx, action, sizeof(action),
+        &ctx, ZIP244_POOL_ORCHARD, action, sizeof(action),
         note_commit_recipient, note_commit_value, note_commit_rseed) == SIGNER_OK);
 
     uint8_t sighash[32];
@@ -525,7 +525,7 @@ static void test_verify_refuses_without_fee_confirm(void) {
     uint8_t action[820];
     build_synthetic_action(action, note_commit_rho, note_commit_expected_cmx);
     assert(orchard_signer_feed_action_with_note(
-        &ctx, action, sizeof(action),
+        &ctx, ZIP244_POOL_ORCHARD, action, sizeof(action),
         note_commit_recipient, note_commit_value, note_commit_rseed) == SIGNER_OK);
 
     uint8_t sighash[32];
@@ -617,7 +617,7 @@ static void test_verify_refuses_partial_confirm(void) {
     for (int i = 0; i < 3; i++) {
         build_synthetic_action(action, note_commit_rho, note_commit_expected_cmx);
         assert(orchard_signer_feed_action_with_note(
-            &ctx, action, sizeof(action),
+            &ctx, ZIP244_POOL_ORCHARD, action, sizeof(action),
             note_commit_recipient, note_commit_value, note_commit_rseed) == SIGNER_OK);
     }
 
@@ -650,7 +650,7 @@ static void test_invalid_action_index(void) {
     uint8_t action[820];
     build_synthetic_action(action, note_commit_rho, note_commit_expected_cmx);
     assert(orchard_signer_feed_action_with_note(
-        &ctx, action, sizeof(action),
+        &ctx, ZIP244_POOL_ORCHARD, action, sizeof(action),
         note_commit_recipient, note_commit_value, note_commit_rseed) == SIGNER_OK);
     assert(orchard_signer_get_action_display(&ctx, 1, recipient, &value) ==
            SIGNER_ERR_INVALID_ACTION_INDEX);
@@ -688,7 +688,7 @@ static void test_sign_refuses_without_verify(void) {
     uint8_t action[820];
     build_synthetic_action(action, note_commit_rho, note_commit_expected_cmx);
     assert(orchard_signer_feed_action_with_note(
-        &ctx, action, sizeof(action),
+        &ctx, ZIP244_POOL_ORCHARD, action, sizeof(action),
         note_commit_recipient, note_commit_value, note_commit_rseed) == SIGNER_OK);
 
     uint8_t sighash[32];
@@ -851,7 +851,7 @@ static void test_recipient_matches_any_after_feed(void) {
     uint8_t action[820];
     build_synthetic_action(action, note_commit_rho, note_commit_expected_cmx);
     assert(orchard_signer_feed_action_with_note(
-               &ctx, action, sizeof(action),
+               &ctx, ZIP244_POOL_ORCHARD, action, sizeof(action),
                note_commit_recipient, note_commit_value, note_commit_rseed)
            == SIGNER_OK);
 

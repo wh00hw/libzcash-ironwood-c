@@ -451,7 +451,7 @@ static void test_orchard_note_commit(void) {
 
     uint8_t cmx[32];
     orchard_compute_cmx(d, pk_d, note_commit_value,
-                        note_commit_rho, note_commit_rseed, cmx);
+                        note_commit_rho, note_commit_rseed, ORCHARD_NOTE_V2, cmx);
 
     assert_eq_bytes("orchard_compute_cmx", note_commit_expected_cmx, cmx, 32);
 }

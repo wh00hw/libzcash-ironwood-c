@@ -73,6 +73,11 @@ add_executable(test_vectors test_vectors.c)
 target_link_libraries(test_vectors PRIVATE zcash-orchard-c-deterministic)
 add_test(NAME test_vectors COMMAND test_vectors)
 
+add_executable(test_ironwood test_ironwood.c)
+target_link_libraries(test_ironwood PRIVATE zcash-orchard-c-deterministic)
+target_compile_options(test_ironwood PRIVATE -UNDEBUG)
+add_test(NAME test_ironwood COMMAND test_ironwood)
+
 add_executable(test_h5 test_h5.c)
 target_link_libraries(test_h5 PRIVATE zcash-orchard-c-deterministic)
 add_test(NAME test_h5 COMMAND test_h5)

@@ -1,22 +1,50 @@
 /**
- * ZIP-244 Transaction Sighash Computation for Zcash v5 Transactions.
+ * ZIP-244 Transaction Sighash Computation for Zcash v5 and v6 Transactions.
  *
  * Implements the shielded sighash algorithm as specified in ZIP-244:
  * https://zips.z.cash/zip-0244
  *
- * Digest tree:
+ * v5 digest tree:
  *   sighash = BLAKE2b-256("ZcashTxHash_" || branch_id_le,
  *       header_digest || transparent_digest || sapling_digest || orchard_digest)
  *
  * Where orchard_digest = BLAKE2b-256("ZTxIdOrchardHash",
  *       compact_digest || memos_digest || noncompact_digest ||
  *       flags[1] || value_balance[8 LE] || anchor[32])
+ *
+ * v6 digest tree (NU6.3 / Ironwood, ZIP 258): adds the Ironwood pool leaf
+ * and moves the shielded-pool anchors out of the effects digest (they are
+ * committed by the authorizing-data digest instead, which the device never
+ * computes):
+ *   sighash = BLAKE2b-256("ZcashTxHash_" || branch_id_le,
+ *       header_digest || transparent_digest || sapling_digest ||
+ *       orchard_digest || ironwood_digest)
+ *
+ * Where orchard_digest  = BLAKE2b-256("ZTxIdOrchardH_v6",
+ *       compact_digest || memos_digest || noncompact_digest ||
+ *       flags[1] || value_balance[8 LE])          (no anchor)
+ * and   ironwood_digest = BLAKE2b-256("ZTxIdIronwd_H_v6",
+ *       compact_digest || memos_digest || noncompact_digest ||
+ *       flags[1] || value_balance[8 LE])          (no anchor)
+ * with the Ironwood action-level digests personalized
+ * "ZTxIdIrnActCH_v6" / "ZTxIdIrnActMH_v6" / "ZTxIdIrnActNH_v6" (the Orchard
+ * ones keep the v5 strings — the parent digest domain-separates them).
+ * An absent pool contributes BLAKE2b-256(pool bundle personalization, "").
  */
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
 #include "blake2b.h"
+
+/**
+ * The shielded value pool an Orchard-protocol bundle belongs to.
+ * Matches the pool byte prefixed to v6 action payloads on the wire.
+ */
+typedef enum {
+    ZIP244_POOL_ORCHARD  = 0x00,
+    ZIP244_POOL_IRONWOOD = 0x01,
+} Zip244Pool;
 
 /**
  * Transaction header metadata needed for sighash computation.
@@ -37,10 +65,20 @@
  * orchard_signer_feed_meta() time. Any non-empty value aborts the
  * session with SIGNER_ERR_SAPLING_NOT_EMPTY before action streaming.
  */
-/** Wire size of the core TxMeta fields (used for ZIP-244 sighash computation). */
+/** Wire size of the core v5 TxMeta fields (used for ZIP-244 sighash computation). */
 #define ZIP244_TX_META_SIZE     125
 /** Wire size with the coin_type extension (network discrimination). */
 #define ZIP244_TX_META_EXT_SIZE 129
+/** Wire size of the core v6 TxMeta fields (adds the Ironwood bundle section:
+ *  ironwood_flags[1] || ironwood_value_balance[8] || ironwood_anchor[32]
+ *  inserted after the Orchard anchor). */
+#define ZIP244_TX_META_V6_SIZE     166
+/** v6 wire size with the coin_type extension. */
+#define ZIP244_TX_META_V6_EXT_SIZE 170
+
+/** NU6.3 consensus constants (v6 transaction format). */
+#define ZIP244_V6_TX_VERSION       0x80000006u
+#define ZIP244_V6_VERSION_GROUP_ID 0xD884B698u
 
 typedef struct {
     uint32_t version;
@@ -51,6 +89,16 @@ typedef struct {
     uint8_t  orchard_flags;
     int64_t  value_balance;
     uint8_t  anchor[32];
+    /** True when the metadata was received in the v6 (170/166-byte) layout;
+     *  the Ironwood fields below are only meaningful in that case. */
+    bool     is_v6;
+    /** Ironwood bundle flag byte (bit 2 = enableCrossAddress under NU6.3). */
+    uint8_t  ironwood_flags;
+    /** Ironwood bundle net value balance (zatoshis, signed). */
+    int64_t  ironwood_value_balance;
+    /** Ironwood bundle anchor. Carried for display/consistency only — under
+     *  the v6 format anchors are NOT part of the effects digest. */
+    uint8_t  ironwood_anchor[32];
     uint8_t  transparent_sig_digest[32];
     uint8_t  sapling_digest[32];
     /** ZIP-32 coin type: 133 = mainnet, 1 = testnet, 0 = unspecified. */
@@ -71,6 +119,12 @@ typedef struct {
     blake2b_state memos_ctx;
     blake2b_state noncompact_ctx;
     uint16_t actions_hashed;
+    /** The pool this state hashes for; selects the bundle-digest
+     *  personalization at finalize time. */
+    Zip244Pool pool;
+    /** True for the v6 commitment format (no anchor in the effects digest,
+     *  v6 bundle personalization). */
+    bool v6;
     bool initialized;
 } Zip244ActionsState;
 
@@ -197,10 +251,22 @@ bool zip244_parse_tx_meta(const uint8_t* data, size_t len, Zip244TxMeta* out);
 size_t zip244_encode_tx_meta(uint8_t* buf, const Zip244TxMeta* meta);
 
 /**
- * Initialize the incremental actions digest state.
- * Must be called before any zip244_hash_action() calls.
+ * Initialize the incremental actions digest state for the legacy v5
+ * Orchard bundle format. Must be called before any zip244_hash_action()
+ * calls. Equivalent to zip244_actions_init_pool(state, ZIP244_POOL_ORCHARD, false).
  */
 void zip244_actions_init(Zip244ActionsState* state);
+
+/**
+ * Initialize the incremental actions digest state for a specific pool and
+ * commitment format (NU6.3 / Ironwood).
+ *
+ * Orchard states use the v5 action-level personalizations regardless of
+ * format (the parent bundle digest domain-separates v5 from v6); Ironwood
+ * states use the "ZTxIdIrnAct{C,M,N}H_v6" personalizations. Ironwood
+ * requires v6 == true.
+ */
+void zip244_actions_init_pool(Zip244ActionsState* state, Zip244Pool pool, bool v6);
 
 /**
  * Hash one action's data incrementally into the three parallel digesters.
@@ -226,6 +292,32 @@ bool zip244_hash_action(Zip244ActionsState* state,
 void zip244_orchard_digest(Zip244ActionsState* state,
                            const Zip244TxMeta* meta,
                            uint8_t digest_out[32]);
+
+/**
+ * Finalize the three action digesters and compute the bundle effects digest
+ * for the state's (pool, format):
+ *
+ *   BLAKE2b-256(bundle_personal,
+ *       compact_digest || memos_digest || noncompact_digest ||
+ *       flags[1] || value_balance[8 LE] [|| anchor[32] if v5])
+ *
+ * bundle_personal is "ZTxIdOrchardHash" (Orchard v5), "ZTxIdOrchardH_v6"
+ * (Orchard v6) or "ZTxIdIronwd_H_v6" (Ironwood). The anchor is hashed only
+ * in the v5 format; under v6 it lives in the authorizing-data digest.
+ * Consumes the state's hash contexts. digest_out must be 32 bytes.
+ */
+void zip244_bundle_digest(Zip244ActionsState* state,
+                          uint8_t flags,
+                          int64_t value_balance,
+                          const uint8_t anchor[32],
+                          uint8_t digest_out[32]);
+
+/**
+ * Compute the empty-bundle effects digest for a shielded pool:
+ * BLAKE2b-256 of no data with the pool's bundle personalization for the
+ * given format. Used for the pool leaves a v6 transaction does not carry.
+ */
+void zip244_pool_empty_digest(Zip244Pool pool, bool v6, uint8_t digest_out[32]);
 
 /**
  * Compute the empty-bundle digest for a protocol component.
@@ -275,3 +367,24 @@ void zip244_header_digest(const Zip244TxMeta* meta, uint8_t digest_out[32]);
 void zip244_shielded_sighash(const Zip244TxMeta* meta,
                              Zip244ActionsState* actions_state,
                              uint8_t sighash_out[32]);
+
+/**
+ * Compute the full v6 (NU6.3 / Ironwood) shielded sighash.
+ *
+ * sighash = BLAKE2b-256("ZcashTxHash_" || consensus_branch_id[4 LE],
+ *     header_digest || transparent_digest || sapling_digest ||
+ *     orchard_digest || ironwood_digest)
+ *
+ * A pool state with zero hashed actions (or a NULL state pointer)
+ * contributes the pool's empty-bundle digest; otherwise the state must have
+ * been initialized with zip244_actions_init_pool() for the matching pool
+ * with v6 == true, and its bundle digest is computed from the pool's
+ * flags/value_balance in `meta` (anchors are NOT hashed under v6).
+ * Consumes the non-empty states' hash contexts.
+ *
+ * sighash_out must be 32 bytes.
+ */
+void zip244_shielded_sighash_v6(const Zip244TxMeta* meta,
+                                Zip244ActionsState* orchard_state,
+                                Zip244ActionsState* ironwood_state,
+                                uint8_t sighash_out[32]);

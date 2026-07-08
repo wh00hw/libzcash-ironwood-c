@@ -27,6 +27,14 @@ static const char PERSONAL_COMPACT[]    = "ZTxIdOrcActCHash";
 static const char PERSONAL_MEMOS[]      = "ZTxIdOrcActMHash";
 static const char PERSONAL_NONCOMPACT[] = "ZTxIdOrcActNHash";
 static const char PERSONAL_SAPLING[]    = "ZTxIdSaplingHash";
+/* v6 (NU6.3) bundle personalizations. The Orchard v6 bundle digest reuses
+ * the v5 action-level personalizations (domain separation happens at the
+ * bundle level); Ironwood has its own action-level set. */
+static const char PERSONAL_ORCHARD_V6[]     = "ZTxIdOrchardH_v6";
+static const char PERSONAL_IRONWOOD[]       = "ZTxIdIronwd_H_v6";
+static const char PERSONAL_IRN_COMPACT[]    = "ZTxIdIrnActCH_v6";
+static const char PERSONAL_IRN_MEMOS[]      = "ZTxIdIrnActMH_v6";
+static const char PERSONAL_IRN_NONCOMPACT[] = "ZTxIdIrnActNH_v6";
 /* Root sighash: first 12 bytes are "ZcashTxHash_", last 4 = branch_id LE */
 
 /* --- Action data field offsets --- */
@@ -287,6 +295,11 @@ static int64_t read_i64_le(const uint8_t* buf) {
 bool zip244_parse_tx_meta(const uint8_t* data, size_t len, Zip244TxMeta* out) {
     if (len < ZIP244_TX_META_SIZE) return false;
 
+    /* The v6 layout inserts the 41-byte Ironwood bundle section after the
+     * Orchard anchor; the layouts are discriminated by wire size (the four
+     * valid sizes — 125/129 v5, 166/170 v6 — are pairwise distinct). */
+    bool v6 = (len == ZIP244_TX_META_V6_SIZE || len == ZIP244_TX_META_V6_EXT_SIZE);
+
     out->version              = read_u32_le(data + 0);
     out->version_group_id     = read_u32_le(data + 4);
     out->consensus_branch_id  = read_u32_le(data + 8);
@@ -295,12 +308,27 @@ bool zip244_parse_tx_meta(const uint8_t* data, size_t len, Zip244TxMeta* out) {
     out->orchard_flags        = data[20];
     out->value_balance        = read_i64_le(data + 21);
     memcpy(out->anchor, data + 29, 32);
-    memcpy(out->transparent_sig_digest, data + 61, 32);
-    memcpy(out->sapling_digest, data + 93, 32);
+    out->is_v6 = v6;
 
-    /* Extended format: coin_type appended after the core 125 bytes */
-    if (len >= ZIP244_TX_META_EXT_SIZE) {
-        out->coin_type = read_u32_le(data + 125);
+    size_t off = 61;
+    if (v6) {
+        out->ironwood_flags         = data[61];
+        out->ironwood_value_balance = read_i64_le(data + 62);
+        memcpy(out->ironwood_anchor, data + 70, 32);
+        off = 102;
+    } else {
+        out->ironwood_flags = 0;
+        out->ironwood_value_balance = 0;
+        memset(out->ironwood_anchor, 0, 32);
+    }
+    memcpy(out->transparent_sig_digest, data + off, 32);
+    memcpy(out->sapling_digest, data + off + 32, 32);
+
+    /* Extended format: coin_type appended after the core fields */
+    size_t core = v6 ? ZIP244_TX_META_V6_SIZE : ZIP244_TX_META_SIZE;
+    size_t ext  = v6 ? ZIP244_TX_META_V6_EXT_SIZE : ZIP244_TX_META_EXT_SIZE;
+    if (len >= ext) {
+        out->coin_type = read_u32_le(data + core);
     } else {
         out->coin_type = 0; /* unspecified (backward compat with old SDK) */
     }
@@ -316,26 +344,47 @@ size_t zip244_encode_tx_meta(uint8_t* buf, const Zip244TxMeta* meta) {
     buf[20] = meta->orchard_flags;
     write_i64_le(buf + 21, meta->value_balance);
     memcpy(buf + 29, meta->anchor, 32);
-    memcpy(buf + 61, meta->transparent_sig_digest, 32);
-    memcpy(buf + 93, meta->sapling_digest, 32);
+    size_t off = 61;
+    if (meta->is_v6) {
+        buf[61] = meta->ironwood_flags;
+        write_i64_le(buf + 62, meta->ironwood_value_balance);
+        memcpy(buf + 70, meta->ironwood_anchor, 32);
+        off = 102;
+    }
+    memcpy(buf + off, meta->transparent_sig_digest, 32);
+    memcpy(buf + off + 32, meta->sapling_digest, 32);
     /* Extended: coin_type (not part of ZIP-244 sighash, used for network validation) */
-    write_u32_le(buf + 125, meta->coin_type);
-    return ZIP244_TX_META_EXT_SIZE;
+    write_u32_le(buf + off + 64, meta->coin_type);
+    return meta->is_v6 ? ZIP244_TX_META_V6_EXT_SIZE : ZIP244_TX_META_EXT_SIZE;
 }
 
 /* ------------------------------------------------------------------ */
 /*  Incremental actions digest                                        */
 /* ------------------------------------------------------------------ */
 
-void zip244_actions_init(Zip244ActionsState* state) {
+void zip244_actions_init_pool(Zip244ActionsState* state, Zip244Pool pool, bool v6) {
     memset(state, 0, sizeof(*state));
 
-    blake2b_InitPersonal(&state->compact_ctx,    32, PERSONAL_COMPACT,    16);
-    blake2b_InitPersonal(&state->memos_ctx,      32, PERSONAL_MEMOS,      16);
-    blake2b_InitPersonal(&state->noncompact_ctx, 32, PERSONAL_NONCOMPACT, 16);
+    if (pool == ZIP244_POOL_IRONWOOD) {
+        blake2b_InitPersonal(&state->compact_ctx,    32, PERSONAL_IRN_COMPACT,    16);
+        blake2b_InitPersonal(&state->memos_ctx,      32, PERSONAL_IRN_MEMOS,      16);
+        blake2b_InitPersonal(&state->noncompact_ctx, 32, PERSONAL_IRN_NONCOMPACT, 16);
+    } else {
+        /* Orchard keeps the v5 action-level personalizations in both
+         * formats; the parent bundle digest domain-separates v5 from v6. */
+        blake2b_InitPersonal(&state->compact_ctx,    32, PERSONAL_COMPACT,    16);
+        blake2b_InitPersonal(&state->memos_ctx,      32, PERSONAL_MEMOS,      16);
+        blake2b_InitPersonal(&state->noncompact_ctx, 32, PERSONAL_NONCOMPACT, 16);
+    }
 
+    state->pool = pool;
+    state->v6 = v6;
     state->actions_hashed = 0;
     state->initialized = true;
+}
+
+void zip244_actions_init(Zip244ActionsState* state) {
+    zip244_actions_init_pool(state, ZIP244_POOL_ORCHARD, false);
 }
 
 bool zip244_hash_action(Zip244ActionsState* state,
@@ -374,9 +423,17 @@ bool zip244_hash_action(Zip244ActionsState* state,
     return true;
 }
 
-void zip244_orchard_digest(Zip244ActionsState* state,
-                           const Zip244TxMeta* meta,
-                           uint8_t digest_out[32]) {
+/** Select the bundle-digest personalization for a (pool, format) pair. */
+static const char* bundle_personal(Zip244Pool pool, bool v6) {
+    if (pool == ZIP244_POOL_IRONWOOD) return PERSONAL_IRONWOOD;
+    return v6 ? PERSONAL_ORCHARD_V6 : PERSONAL_ORCHARD;
+}
+
+void zip244_bundle_digest(Zip244ActionsState* state,
+                          uint8_t flags,
+                          int64_t value_balance,
+                          const uint8_t anchor[32],
+                          uint8_t digest_out[32]) {
     /* Finalize the three sub-digests */
     uint8_t compact_digest[32], memos_digest[32], noncompact_digest[32];
 
@@ -384,28 +441,43 @@ void zip244_orchard_digest(Zip244ActionsState* state,
     blake2b_Final(&state->memos_ctx,      memos_digest,      32);
     blake2b_Final(&state->noncompact_ctx, noncompact_digest, 32);
 
-    /* Combine into orchard digest:
-     * BLAKE2b-256("ZTxIdOrchardHash",
-     *     compact || memos || noncompact || flags[1] || value_balance[8] || anchor[32])
+    /* Combine into the bundle effects digest:
+     * BLAKE2b-256(bundle_personal,
+     *     compact || memos || noncompact || flags[1] || value_balance[8]
+     *     [|| anchor[32] — v5 format only; under v6 the anchor is committed
+     *      by the authorizing-data digest instead])
      */
-    blake2b_state orchard;
-    blake2b_InitPersonal(&orchard, 32, PERSONAL_ORCHARD, 16);
-    blake2b_Update(&orchard, compact_digest, 32);
-    blake2b_Update(&orchard, memos_digest, 32);
-    blake2b_Update(&orchard, noncompact_digest, 32);
+    blake2b_state bundle;
+    blake2b_InitPersonal(&bundle, 32, bundle_personal(state->pool, state->v6), 16);
+    blake2b_Update(&bundle, compact_digest, 32);
+    blake2b_Update(&bundle, memos_digest, 32);
+    blake2b_Update(&bundle, noncompact_digest, 32);
 
     /* Flags: 1 byte */
-    blake2b_Update(&orchard, &meta->orchard_flags, 1);
+    blake2b_Update(&bundle, &flags, 1);
 
     /* Value balance: 8 bytes LE signed */
     uint8_t vb[8];
-    write_i64_le(vb, meta->value_balance);
-    blake2b_Update(&orchard, vb, 8);
+    write_i64_le(vb, value_balance);
+    blake2b_Update(&bundle, vb, 8);
 
-    /* Anchor: 32 bytes */
-    blake2b_Update(&orchard, meta->anchor, 32);
+    /* Anchor: 32 bytes, v5 format only */
+    if (!state->v6) {
+        blake2b_Update(&bundle, anchor, 32);
+    }
 
-    blake2b_Final(&orchard, digest_out, 32);
+    blake2b_Final(&bundle, digest_out, 32);
+}
+
+void zip244_orchard_digest(Zip244ActionsState* state,
+                           const Zip244TxMeta* meta,
+                           uint8_t digest_out[32]) {
+    zip244_bundle_digest(state, meta->orchard_flags, meta->value_balance,
+                         meta->anchor, digest_out);
+}
+
+void zip244_pool_empty_digest(Zip244Pool pool, bool v6, uint8_t digest_out[32]) {
+    zip244_empty_digest(bundle_personal(pool, v6), digest_out);
 }
 
 /* ------------------------------------------------------------------ */
@@ -476,5 +548,58 @@ void zip244_shielded_sighash(const Zip244TxMeta* meta,
     blake2b_Update(&root, transparent_digest, 32);
     blake2b_Update(&root, sapling_digest, 32);
     blake2b_Update(&root, orchard_digest_val, 32);
+    blake2b_Final(&root, sighash_out, 32);
+}
+
+void zip244_shielded_sighash_v6(const Zip244TxMeta* meta,
+                                Zip244ActionsState* orchard_state,
+                                Zip244ActionsState* ironwood_state,
+                                uint8_t sighash_out[32]) {
+    /* 1. Header digest (same construction as v5; the v6 version and
+     *    version-group-id values feed through the meta fields). */
+    uint8_t hdr_digest[32];
+    zip244_header_digest(meta, hdr_digest);
+
+    /* 2./3. Transparent + Sapling digests (pre-computed by companion;
+     *    Sapling emptiness is enforced by the signer at feed_meta). */
+    const uint8_t *transparent_digest = meta->transparent_sig_digest;
+    const uint8_t *sapling_digest = meta->sapling_digest;
+
+    /* 4. Orchard (sealed pool) digest — empty-bundle constant when the
+     *    transaction carries no Orchard actions. No anchor under v6. */
+    uint8_t orchard_digest_val[32];
+    if (orchard_state != NULL && orchard_state->actions_hashed > 0) {
+        zip244_bundle_digest(orchard_state, meta->orchard_flags,
+                             meta->value_balance, meta->anchor,
+                             orchard_digest_val);
+    } else {
+        zip244_pool_empty_digest(ZIP244_POOL_ORCHARD, true, orchard_digest_val);
+    }
+
+    /* 5. Ironwood digest — empty-bundle constant when absent. */
+    uint8_t ironwood_digest_val[32];
+    if (ironwood_state != NULL && ironwood_state->actions_hashed > 0) {
+        zip244_bundle_digest(ironwood_state, meta->ironwood_flags,
+                             meta->ironwood_value_balance, meta->ironwood_anchor,
+                             ironwood_digest_val);
+    } else {
+        zip244_pool_empty_digest(ZIP244_POOL_IRONWOOD, true, ironwood_digest_val);
+    }
+
+    /* 6. Root sighash:
+     * BLAKE2b-256("ZcashTxHash_" || consensus_branch_id[4 LE],
+     *     header || transparent || sapling || orchard || ironwood)
+     */
+    uint8_t root_personal[16];
+    memcpy(root_personal, "ZcashTxHash_", 12);
+    write_u32_le(root_personal + 12, meta->consensus_branch_id);
+
+    blake2b_state root;
+    blake2b_InitPersonal(&root, 32, (const char*)root_personal, 16);
+    blake2b_Update(&root, hdr_digest, 32);
+    blake2b_Update(&root, transparent_digest, 32);
+    blake2b_Update(&root, sapling_digest, 32);
+    blake2b_Update(&root, orchard_digest_val, 32);
+    blake2b_Update(&root, ironwood_digest_val, 32);
     blake2b_Final(&root, sighash_out, 32);
 }

@@ -898,6 +898,7 @@ void orchard_compute_cmx(
     uint64_t value,
     const uint8_t rho[32],
     const uint8_t rseed[32],
+    uint8_t note_version,
     uint8_t cmx_out[32])
 {
     /* The 1086-bit Sinsemilla input doubles as our scratchpad: every
@@ -926,43 +927,63 @@ void orchard_compute_cmx(
     memcpy(msg + 72, rho, 31);
     msg[103] = rho[31] & 0x7F;
 
-    /* Compute rcm and psi via PRF^expand. The prf scratch buffers are
-     * scoped tightly so GCC can overlap them; rcm_le and psi_le live in
-     * sibling scopes for the same reason. */
+    /* Compute psi first (needed for the Sinsemilla message in both note
+     * versions, and as an rcm input for V3), then rcm per note version. */
     bignum256 rcm_bn;
     {
         uint8_t prf_in[1 + 32];
         uint8_t prf_out[64];
+        uint8_t psi_le[32];
         memcpy(prf_in + 1, rho, 32);
-
-        /* rcm = ToScalar(PRF^expand(rseed, [0x05] || rho)) */
-        {
-            uint8_t rcm_le[32];
-            prf_in[0] = 0x05;
-            prf_expand(rseed, prf_in, sizeof(prf_in), prf_out);
-            to_scalar(prf_out, rcm_le);
-            bn_read_le(rcm_le, &rcm_bn);
-            memzero(rcm_le, sizeof(rcm_le));
-        }
 
         /* psi = ToBase(PRF^expand(rseed, [0x09] || rho)). The 255 valid
          * bits are packed into msg[103..135] starting at bit 7 of byte 103
          * — equivalent to (psi & ~bit255) shifted left by 7 bits and OR'd
          * into msg starting at byte 103. */
-        {
-            uint8_t psi_le[32];
-            prf_in[0] = 0x09;
-            prf_expand(rseed, prf_in, sizeof(prf_in), prf_out);
-            to_base(prf_out, psi_le);
-            psi_le[31] &= 0x7F;
-            for (int k = 0; k < 32; k++) {
-                uint8_t b = psi_le[k];
-                msg[103 + k] |= (uint8_t)(b << 7);
-                msg[104 + k] |= (uint8_t)(b >> 1);
-            }
-            memzero(psi_le, sizeof(psi_le));
+        prf_in[0] = 0x09;
+        prf_expand(rseed, prf_in, sizeof(prf_in), prf_out);
+        to_base(prf_out, psi_le);
+        psi_le[31] &= 0x7F;
+        for (int k = 0; k < 32; k++) {
+            uint8_t b = psi_le[k];
+            msg[103 + k] |= (uint8_t)(b << 7);
+            msg[104 + k] |= (uint8_t)(b >> 1);
         }
 
+        {
+            uint8_t rcm_le[32];
+            if (note_version == ORCHARD_NOTE_V3) {
+                /* ZIP-2005 quantum-recoverable rcm (Ironwood V3 notes):
+                 * binds rcm to all note fields for post-quantum commitment
+                 * binding.
+                 *   rcm = ToScalar(PRF^expand(rseed,
+                 *       [0x0B] || repr_P(g_d)(32) || repr_P(pk_d)(32) ||
+                 *       v_LE(8) || rho(32) || psi(32)))
+                 * repr_P(g_d) and v_LE are already serialized in the
+                 * Sinsemilla message scratchpad (msg[0..32] / msg[64..72]).
+                 * Static storage for the 137-byte preimage keeps the frame
+                 * inside the embedded stack budget; zeroed before return. */
+                static uint8_t pre[1 + 32 + 32 + 8 + 32 + 32];
+                pre[0] = 0x0B;
+                memcpy(pre + 1, msg, 32);        /* repr_P(g_d) */
+                memcpy(pre + 33, pk_d, 32);      /* repr_P(pk_d) */
+                memcpy(pre + 65, msg + 64, 8);   /* value LE */
+                memcpy(pre + 73, rho, 32);
+                memcpy(pre + 105, psi_le, 32);
+                prf_expand(rseed, pre, sizeof(pre), prf_out);
+                to_scalar(prf_out, rcm_le);
+                memzero(pre, sizeof(pre));
+            } else {
+                /* ZIP-212 V2: rcm = ToScalar(PRF^expand(rseed, [0x05] || rho)) */
+                prf_in[0] = 0x05;
+                prf_expand(rseed, prf_in, sizeof(prf_in), prf_out);
+                to_scalar(prf_out, rcm_le);
+            }
+            bn_read_le(rcm_le, &rcm_bn);
+            memzero(rcm_le, sizeof(rcm_le));
+        }
+
+        memzero(psi_le, sizeof(psi_le));
         memzero(prf_out, sizeof(prf_out));
         memzero(prf_in, sizeof(prf_in));
     }
@@ -1070,12 +1091,16 @@ int orchard_compute_enc_ciphertext_from_rseed(
     const uint8_t rseed[32],
     const uint8_t rho[32],
     const uint8_t memo[512],
+    uint8_t note_version,
     uint8_t enc_ciphertext_out[580],
     uint8_t epk_out[32])
 {
     uint8_t esk[32];
+    /* esk derivation is shared between V2 (ZIP-212) and V3 (ZIP-2005)
+     * note plaintexts; only the plaintext lead byte and rcm differ. */
     orchard_derive_esk_from_rseed(rseed, rho, esk);
     int rc = orchard_compute_enc_ciphertext(d, pk_d, value, rseed, memo, esk,
+                                             note_version,
                                              enc_ciphertext_out, epk_out);
     memzero(esk, sizeof(esk));
     return rc;
@@ -1088,6 +1113,7 @@ int orchard_compute_enc_ciphertext(
     const uint8_t rseed[32],
     const uint8_t memo[512],
     const uint8_t esk[32],
+    uint8_t note_version,
     uint8_t enc_ciphertext_out[580],
     uint8_t epk_out[32])
 {
@@ -1131,16 +1157,21 @@ int orchard_compute_enc_ciphertext(
     pallas_point_mul(&ss, &esk_bn, &pk_d_pt);
     pallas_encode_repr_p(ss_bytes, &ss);
 
-    /* 5. K_enc = BLAKE2b-256("Zcash_OrchardKDF", epk_bytes || ss_bytes).
-     *    Matches Zcash protocol spec §5.4.4.6 / §4.20. */
+    /* 5. K_enc = BLAKE2b-256("Zcash_OrchardKDF", ss_bytes || epk_bytes).
+     *    Matches Zcash protocol spec §5.4.5.6: the shared secret is hashed
+     *    FIRST, then the ephemeral key (cross-validated against the orchard
+     *    crate's kdf_orchard in tests/test_ironwood.c — an earlier revision
+     *    hashed the two in the opposite order). */
     blake2b_InitPersonal(&h, 32, "Zcash_OrchardKDF", 16);
-    blake2b_Update(&h, epk_bytes, 32);
     blake2b_Update(&h, ss_bytes, 32);
+    blake2b_Update(&h, epk_bytes, 32);
     blake2b_Final(&h, k_enc, 32);
 
     /* 6. Note plaintext (564 bytes):
-     *   leadByte(0x02) || d(11) || value_LE(8) || rseed(32) || memo(512) */
-    np[0] = 0x02;
+     *   leadByte || d(11) || value_LE(8) || rseed(32) || memo(512)
+     * leadByte = 0x02 for ZIP-212 (Orchard) notes, 0x03 for ZIP-2005
+     * (Ironwood V3) notes. The layout is otherwise identical. */
+    np[0] = (note_version == ORCHARD_NOTE_V3) ? 0x03 : 0x02;
     memcpy(np + 1, d, 11);
     for (int i = 0; i < 8; i++) {
         np[12 + i] = (uint8_t)((value >> (8 * i)) & 0xFFu);

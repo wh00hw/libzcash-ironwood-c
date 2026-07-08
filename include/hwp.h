@@ -52,6 +52,18 @@
 #define HWP_NOTE_PLAINTEXT_V5_SIZE  (HWP_NOTE_PLAINTEXT_SIZE + 512)
 #define HWP_ACTION_DATA_SIZE_V5  (HWP_ACTION_DATA_SIZE + HWP_NOTE_PLAINTEXT_V5_SIZE)
 
+// v6 (NU6.3 / Ironwood) action payloads: a 1-byte pool tag (0x00 = sealed
+// Orchard pool, 0x01 = Ironwood pool) prefixed to the v4 or v5 payload.
+// The dispatcher strips the tag and routes the action into the matching
+// ZIP-244 pool digest tree; the remaining bytes reuse the v4/v5 layouts.
+//   memo-verifying: 1 + 1415 = 1416 bytes
+//   cmx-only:       1 + 903  = 904 bytes
+// v6 sessions are recognized by the TxMeta layout (170/166 bytes, with the
+// Ironwood bundle section); v5 sessions carry no pool tag.
+#define HWP_POOL_TAG_SIZE 1
+#define HWP_ACTION_DATA_SIZE_V6         (HWP_POOL_TAG_SIZE + HWP_ACTION_DATA_SIZE_V5)
+#define HWP_ACTION_DATA_SIZE_V6_COMPACT (HWP_POOL_TAG_SIZE + HWP_ACTION_DATA_SIZE_V4)
+
 // TxOutput special indices for v2 sighash verification protocol:
 // 0xFFFF = transaction metadata (header + orchard bundle info, 61 bytes)
 // 0..N-1 = action data (820 bytes each)

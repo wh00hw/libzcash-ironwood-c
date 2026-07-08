@@ -3,6 +3,13 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* Note plaintext versions (lead byte of the 564-byte note plaintext).
+ * V2 = ZIP-212 (Orchard pool), V3 = ZIP-2005 quantum-recoverable notes
+ * (Ironwood pool, NU6.3). V3 shares the V2 layout and esk/psi derivations
+ * but uses lead byte 0x03 and an rcm derivation bound to all note fields. */
+#define ORCHARD_NOTE_V2 2
+#define ORCHARD_NOTE_V3 3
+
 // ZIP-32 Orchard master key derivation from BIP39 seed
 // BLAKE2b-512("ZcashIP32Orchard", seed) -> (sk, chaincode)
 void orchard_master_key(
@@ -197,6 +204,12 @@ void ff1_aes256_encrypt(const uint8_t key[32], const uint8_t in[11], uint8_t out
  *                 design re-uses the action nullifier)
  * @param rseed    random seed for the output note (32 bytes); must be
  *                 the value the constructor used to derive psi/rcm
+ * @param note_version  ORCHARD_NOTE_V2 (ZIP-212, Orchard pool) or
+ *                 ORCHARD_NOTE_V3 (ZIP-2005, Ironwood pool). V3 uses the
+ *                 quantum-recoverable rcm derivation that binds rcm to all
+ *                 note fields:
+ *                   rcm = ToScalar(PRF_expand(rseed, [0x0B] || repr_P(g_d) ||
+ *                         repr_P(pk_d) || v_LE(8) || rho || psi))
  * @param cmx_out  32-byte output, x-coordinate of NoteCommitment in LE form
  */
 void orchard_compute_cmx(
@@ -205,6 +218,7 @@ void orchard_compute_cmx(
     uint64_t value,
     const uint8_t rho[32],
     const uint8_t rseed[32],
+    uint8_t note_version,
     uint8_t cmx_out[32]);
 
 /**
@@ -227,9 +241,12 @@ void orchard_compute_cmx(
  *   SharedSecret = [esk]·pk_d                                (Pallas pt)
  *   K_enc        = BLAKE2b-256("Zcash_OrchardKDF",
  *                              repr_P(epk) || repr_P(ss))
- *   np           = leadByte(0x02) || d(11) || value_LE(8) ||
+ *   np           = leadByte || d(11) || value_LE(8) ||
  *                  rseed(32) || memo(512)                    (564 bytes)
  *   enc_ciphertext = ChaCha20-Poly1305_Encrypt(K_enc, nonce=0, np)
+ *
+ * leadByte is 0x02 for V2 (ZIP-212, Orchard pool) notes and 0x03 for V3
+ * (ZIP-2005, Ironwood pool) notes; select via `note_version`.
  *
  * On the device the caller compares `enc_ciphertext_out` constant-time
  * against the action's `enc_ciphertext` field; a mismatch means the
@@ -247,6 +264,7 @@ int orchard_compute_enc_ciphertext(
     const uint8_t rseed[32],
     const uint8_t memo[512],
     const uint8_t esk[32],
+    uint8_t note_version,
     uint8_t enc_ciphertext_out[580],
     uint8_t epk_out[32]);
 
@@ -272,5 +290,6 @@ int orchard_compute_enc_ciphertext_from_rseed(
     const uint8_t rseed[32],
     const uint8_t rho[32],
     const uint8_t memo[512],
+    uint8_t note_version,
     uint8_t enc_ciphertext_out[580],
     uint8_t epk_out[32]);

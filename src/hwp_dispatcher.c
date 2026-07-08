@@ -343,25 +343,47 @@ static HWP_NOINLINE bool handle_tx_output(HwpDispatcher* d, HwpFrame* f) {
     } else {
         /* Action data 0..N-1. Discriminate v4 vs v5 by payload size:
          *   v4 (903 B)  = action(820) + recipient(43) + value(8) + rseed(32)
-         *   v5 (1447 B) = v4 + memo(512) + esk(32)
+         *   v5 (1415 B) = v4 + memo(512)
          * The v5 path additionally verifies enc_ciphertext + epk on-device,
-         * closing the memo-substitution attack that v4 cmx-only leaves open. */
+         * closing the memo-substitution attack that v4 cmx-only leaves open.
+         *
+         * v6 (NU6.3 / Ironwood) sessions — recognized by the v6 TxMeta
+         * layout received at feed_meta — prefix every action payload with
+         * a 1-byte pool tag (0x00 = sealed Orchard, 0x01 = Ironwood).
+         * Strip and validate it, then reuse the v4/v5 size discrimination
+         * on the remainder; the tag routes the action into the matching
+         * ZIP-244 pool digest tree. */
         phase(d, HWP_PHASE_VERIFY,
               (uint16_t)(txo.output_index + 1), txo.total_outputs);
         if(d->ui.progress) {
             d->ui.progress(0, "Verifying output...", d->user_ctx);
         }
 
-        if(txo.output_data_len == HWP_ACTION_DATA_SIZE_V5) {
+        const uint8_t* adata = txo.output_data;
+        size_t alen = txo.output_data_len;
+        Zip244Pool pool = ZIP244_POOL_ORCHARD;
+        if(d->signer->tx_meta.is_v6) {
+            if(alen < HWP_POOL_TAG_SIZE || adata[0] > ZIP244_POOL_IRONWOOD) {
+                send_error(d, f->seq, HWP_ERR_BAD_FRAME,
+                           "Bad v6 action pool tag");
+                orchard_signer_reset(d->signer);
+                return false;
+            }
+            pool = (Zip244Pool)adata[0];
+            adata += HWP_POOL_TAG_SIZE;
+            alen -= HWP_POOL_TAG_SIZE;
+        }
+
+        if(alen == HWP_ACTION_DATA_SIZE_V5) {
             HwpActionV5 av5;
-            if(!hwp_parse_action_v5(txo.output_data, txo.output_data_len, &av5)) {
+            if(!hwp_parse_action_v5(adata, alen, &av5)) {
                 send_error(d, f->seq, HWP_ERR_BAD_FRAME,
                            "Action v5 payload size mismatch");
                 orchard_signer_reset(d->signer);
                 return false;
             }
             serr = orchard_signer_feed_action_with_note_and_memo(
-                d->signer, av5.action, HWP_ACTION_DATA_SIZE,
+                d->signer, pool, av5.action, HWP_ACTION_DATA_SIZE,
                 av5.recipient, av5.value, av5.rseed,
                 av5.memo);
             if(serr == SIGNER_ERR_NOTE_COMMITMENT_MISMATCH) {
@@ -392,14 +414,14 @@ static HWP_NOINLINE bool handle_tx_output(HwpDispatcher* d, HwpFrame* f) {
         } else {
             /* Backward-compat v4 path. */
             HwpActionV4 av4;
-            if(!hwp_parse_action_v4(txo.output_data, txo.output_data_len, &av4)) {
+            if(!hwp_parse_action_v4(adata, alen, &av4)) {
                 send_error(d, f->seq, HWP_ERR_BAD_FRAME,
                            "Action payload size mismatch");
                 orchard_signer_reset(d->signer);
                 return false;
             }
             serr = orchard_signer_feed_action_with_note(
-                d->signer, av4.action, HWP_ACTION_DATA_SIZE,
+                d->signer, pool, av4.action, HWP_ACTION_DATA_SIZE,
                 av4.recipient, av4.value, av4.rseed);
             if(serr == SIGNER_ERR_NOTE_COMMITMENT_MISMATCH) {
                 send_error(d, f->seq, HWP_ERR_NOTE_COMMITMENT_MISMATCH,

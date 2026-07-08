@@ -1,0 +1,14 @@
+[package]
+name = "gen_ironwood_vectors"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+orchard = { version = "=0.15.0-pre.2", default-features = false, features = ["std"] }
+zcash_note_encryption = "0.4"
+zcash_primitives = { version = "=0.29.0-pre.0", default-features = false, features = ["std"] }
+zcash_protocol = "=0.10.0-pre.0"
+zcash_transparent = { version = "=0.9.0-pre.0", default-features = false }
+sapling-crypto = { version = "0.7", default-features = false }
+nonempty = "0.11"
+hex = "0.4"

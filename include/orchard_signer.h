@@ -121,6 +121,10 @@ typedef enum {
                                             decode to a valid Pallas point
                                             (x^3 + 5 is a non-square mod p).
                                             Structurally invalid input. */
+    SIGNER_ERR_BAD_POOL,                 /* action pool tag invalid for this
+                                            session: Ironwood action in a v5
+                                            transaction, or an unknown pool
+                                            byte on a v6 action payload. */
 } OrchardSignerError;
 
 /**
@@ -177,6 +181,11 @@ typedef struct {
     OrchardSignerState state;
     Zip244TxMeta tx_meta;
     Zip244ActionsState actions_state;
+    /** Ironwood pool digest state (NU6.3, v6 transactions only). The legacy
+     *  `actions_state` hashes the (sealed) Orchard pool's actions; this one
+     *  hashes the Ironwood pool's. Wire actions are routed by their pool
+     *  tag. Unused (zero actions => empty-bundle leaf) for v5 sessions. */
+    Zip244ActionsState ironwood_actions_state;
     Zip244TransparentState transparent_state;   /* v3: transparent digest */
     uint16_t actions_expected;
     uint16_t actions_received;
@@ -238,10 +247,14 @@ OrchardSignerError orchard_signer_feed_meta(OrchardSignerCtx *ctx,
  * Feed one action's data (820 bytes).
  * Must be called in order: index 0, 1, ..., N-1.
  *
+ * @param pool         The shielded pool the action belongs to. Ironwood is
+ *                     only accepted for v6 sessions (v6 TxMeta layout);
+ *                     v5 sessions must pass ZIP244_POOL_ORCHARD.
  * @param action_data  Raw action bytes (HWP_ACTION_DATA_SIZE)
  * @param action_len   Length of action_data
  */
 OrchardSignerError orchard_signer_feed_action(OrchardSignerCtx *ctx,
+                                               Zip244Pool pool,
                                                const uint8_t *action_data, size_t action_len);
 
 /**
@@ -272,6 +285,7 @@ OrchardSignerError orchard_signer_feed_action(OrchardSignerCtx *ctx,
  */
 OrchardSignerError orchard_signer_feed_action_with_note(
     OrchardSignerCtx *ctx,
+    Zip244Pool pool,
     const uint8_t *action_data, size_t action_len,
     const uint8_t recipient[43],
     uint64_t value,
@@ -345,6 +359,7 @@ OrchardSignerError orchard_signer_feed_action_with_note(
  */
 OrchardSignerError orchard_signer_feed_action_with_note_and_memo(
     OrchardSignerCtx *ctx,
+    Zip244Pool pool,
     const uint8_t *action_data, size_t action_len,
     const uint8_t recipient[43],
     uint64_t value,
