@@ -928,12 +928,23 @@ void orchard_compute_cmx(
     msg[103] = rho[31] & 0x7F;
 
     /* Compute psi first (needed for the Sinsemilla message in both note
-     * versions, and as an rcm input for V3), then rcm per note version. */
+     * versions, and as an rcm input for V3), then rcm per note version.
+     *
+     * `pre` is the ZIP-2005 rcm preimage laid out as
+     *   [0x0B] || repr_P(g_d)(32) || repr_P(pk_d)(32) || v_LE(8) ||
+     *   rho(32) || psi(32)
+     * and doubles as the psi scratch buffer (psi is written straight into
+     * its final slot at pre+105) so no separate psi buffer stays live on
+     * the stack — the frame must fit the embedded 512-byte per-function
+     * budget (scripts/check_stack.sh). Static storage, single-threaded
+     * signer, memzero'd before return — same pattern as the other Pallas
+     * heavyweights. */
     bignum256 rcm_bn;
     {
+        static uint8_t pre[1 + 32 + 32 + 8 + 32 + 32];
         uint8_t prf_in[1 + 32];
         uint8_t prf_out[64];
-        uint8_t psi_le[32];
+        uint8_t *psi_le = pre + 105;
         memcpy(prf_in + 1, rho, 32);
 
         /* psi = ToBase(PRF^expand(rseed, [0x09] || rho)). The 255 valid
@@ -960,19 +971,15 @@ void orchard_compute_cmx(
                  *       [0x0B] || repr_P(g_d)(32) || repr_P(pk_d)(32) ||
                  *       v_LE(8) || rho(32) || psi(32)))
                  * repr_P(g_d) and v_LE are already serialized in the
-                 * Sinsemilla message scratchpad (msg[0..32] / msg[64..72]).
-                 * Static storage for the 137-byte preimage keeps the frame
-                 * inside the embedded stack budget; zeroed before return. */
-                static uint8_t pre[1 + 32 + 32 + 8 + 32 + 32];
+                 * Sinsemilla message scratchpad (msg[0..32] / msg[64..72]);
+                 * psi already sits at pre+105. */
                 pre[0] = 0x0B;
                 memcpy(pre + 1, msg, 32);        /* repr_P(g_d) */
                 memcpy(pre + 33, pk_d, 32);      /* repr_P(pk_d) */
                 memcpy(pre + 65, msg + 64, 8);   /* value LE */
                 memcpy(pre + 73, rho, 32);
-                memcpy(pre + 105, psi_le, 32);
                 prf_expand(rseed, pre, sizeof(pre), prf_out);
                 to_scalar(prf_out, rcm_le);
-                memzero(pre, sizeof(pre));
             } else {
                 /* ZIP-212 V2: rcm = ToScalar(PRF^expand(rseed, [0x05] || rho)) */
                 prf_in[0] = 0x05;
@@ -983,7 +990,7 @@ void orchard_compute_cmx(
             memzero(rcm_le, sizeof(rcm_le));
         }
 
-        memzero(psi_le, sizeof(psi_le));
+        memzero(pre, sizeof(pre));
         memzero(prf_out, sizeof(prf_out));
         memzero(prf_in, sizeof(prf_in));
     }
