@@ -292,6 +292,14 @@ OrchardSignerError orchard_signer_feed_action(OrchardSignerCtx *ctx,
         return SIGNER_ERR_BAD_ACTION;
     }
 
+    /* No note plaintext on this path, so there is nothing to display —
+     * mark the slot explicitly (a zero-initialised entry would otherwise
+     * alias memo_pool[0]). */
+    if (ctx->actions_received < ORCHARD_SIGNER_MAX_ACTIONS) {
+        ctx->actions_display[ctx->actions_received].memo_slot =
+            ORCHARD_SIGNER_MEMO_NONE;
+    }
+
     ctx->actions_received++;
     return SIGNER_OK;
 }
@@ -372,6 +380,7 @@ OrchardSignerError orchard_signer_feed_action_with_note(
     memcpy(disp->recipient, recipient, 43);
     disp->value = value;
     disp->confirmed = false;
+    disp->memo_slot = ORCHARD_SIGNER_MEMO_NONE;
 
     ctx->actions_received++;
     return SIGNER_OK;
@@ -467,13 +476,30 @@ OrchardSignerError orchard_signer_feed_action_with_note_and_memo(
     /* Capture display info — identical to feed_action_with_note, PLUS the
      * memo plaintext so the firmware UI can render it on the trusted
      * screen (closes the "memo bound but not user-visible" gap that the
-     * AEAD recomputation alone leaves open). */
+     * AEAD recomputation alone leaves open).
+     *
+     * Memos live in a small shared pool (see ORCHARD_SIGNER_MAX_MEMOS):
+     * a ZIP-302 empty memo (0xF6 lead byte) is cryptographically verified
+     * above like any other but has nothing to display, so it does not
+     * occupy a slot. A transaction carrying more non-empty memos than the
+     * pool holds cannot be fully reviewed on-device and is rejected —
+     * silently dropping a memo from review would reopen the very gap this
+     * path closes. */
     OrchardActionDisplay *disp = &ctx->actions_display[ctx->actions_received];
     memcpy(disp->recipient, recipient, 43);
     disp->value = value;
     disp->confirmed = false;
-    memcpy(disp->memo, memo, 512);
-    disp->memo_present = true;
+    if (memo[0] == 0xF6) {
+        disp->memo_slot = ORCHARD_SIGNER_MEMO_NONE;
+    } else {
+        if (ctx->memos_used >= ORCHARD_SIGNER_MAX_MEMOS) {
+            orchard_signer_reset(ctx);
+            return SIGNER_ERR_TOO_MANY_ACTIONS;
+        }
+        disp->memo_slot = ctx->memos_used;
+        memcpy(ctx->memo_pool[ctx->memos_used], memo, 512);
+        ctx->memos_used++;
+    }
 
     ctx->actions_received++;
     return SIGNER_OK;
@@ -504,8 +530,19 @@ OrchardSignerError orchard_signer_get_action_memo(
         return SIGNER_ERR_INVALID_ACTION_INDEX;
     }
     const OrchardActionDisplay *disp = &ctx->actions_display[idx];
-    if (memo_out)    memcpy(memo_out, disp->memo, 512);
-    if (present_out) *present_out = disp->memo_present;
+    bool present = disp->memo_slot != ORCHARD_SIGNER_MEMO_NONE;
+    if (memo_out) {
+        if (present) {
+            memcpy(memo_out, ctx->memo_pool[disp->memo_slot], 512);
+        } else {
+            /* Nothing captured for this action: return the ZIP-302 empty
+             * memo so callers that ignore present_out still see a
+             * well-formed "no memo" plaintext. */
+            memset(memo_out, 0, 512);
+            memo_out[0] = 0xF6;
+        }
+    }
+    if (present_out) *present_out = present;
     return SIGNER_OK;
 }
 

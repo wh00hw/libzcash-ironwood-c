@@ -17,14 +17,21 @@
 
 #define HWP_HEADER_SIZE   6
 #define HWP_CRC_SIZE      2
-// Bumped from 1024 to 2048 in v5 to fit the action+full-note-plaintext+memo+
-// esk payload (1447 bytes) used by orchard_signer_feed_action_with_note_and_memo.
-// The earlier 1024-byte cap was sized for v4 (903-byte payload); v5 needs more
-// for the 512-byte memo and the 32-byte esk required to recompute
-// enc_ciphertext on-device. Firmware buffers (in + out) grow accordingly, ~2 KB
-// extra static SRAM per direction — fits comfortably on ESP32 / STM32WB targets.
+// Default generously sized above the largest protocol payload: the v6
+// memo-verifying action (pool tag 1 + action 820 + recipient 43 + value 8 +
+// rseed 32 + memo 512 = 1416 bytes) plus the 4-byte TX_OUTPUT header = 1420.
+//
+// RAM-constrained targets may override with a compile definition — the value
+// sizes the RX frame buffer embedded in HwpDispatcher — as long as it stays
+// >= 1420 (the protocol's real maximum) and is applied uniformly to every
+// translation unit (struct layout!). FlipZcash builds with
+// HWP_MAX_PAYLOAD=1536 to fit the Flipper's FAP loader budget.
+#ifndef HWP_MAX_PAYLOAD
 #define HWP_MAX_PAYLOAD   2048
-#define HWP_MAX_FRAME     (HWP_HEADER_SIZE + HWP_MAX_PAYLOAD + HWP_CRC_SIZE) // 2056
+#endif
+_Static_assert(HWP_MAX_PAYLOAD >= 1420,
+               "HWP_MAX_PAYLOAD must fit the v6 memo-verifying action payload (1420 bytes)");
+#define HWP_MAX_FRAME     (HWP_HEADER_SIZE + HWP_MAX_PAYLOAD + HWP_CRC_SIZE)
 
 // Action data size per TxOutput message (v2 sighash verification):
 // cv_net(32) + nullifier(32) + rk(32) + cmx(32) + ephemeral_key(32) + enc_ciphertext(580) + out_ciphertext(80)
@@ -138,6 +145,16 @@ typedef enum {
 // Total: 81 + recipient_len
 #define HWP_SIGN_REQ_FIXED 81 // 32+32+8+8+1
 
+// Maximum recipient-string length. recipient_len is a single wire byte, so
+// the hard ceiling is 255; the buffer holds that plus a NUL terminator. A
+// multi-receiver Unified Address (Orchard + Sapling + transparent) runs well
+// past 127 chars — a testnet UA with all three is ~217 — so the earlier
+// 127-byte cap rejected perfectly valid destinations. Keep this in sync with
+// HWP_MAX_RECIPIENT in the host SDK (src/protocol/hwp.rs).
+#define HWP_MAX_RECIPIENT 255
+_Static_assert(HWP_MAX_RECIPIENT <= 255,
+               "recipient_len is a single wire byte; HWP_MAX_RECIPIENT cannot exceed 255");
+
 // TX_OUTPUT payload:
 //   output_index[2 LE] || total_outputs[2 LE] || output_data[N]
 #define HWP_TX_OUTPUT_HEADER 4 // 2+2
@@ -150,7 +167,7 @@ typedef struct {
     uint64_t amount;
     uint64_t fee;
     uint8_t recipient_len;
-    char recipient[128];
+    char recipient[HWP_MAX_RECIPIENT + 1]; // + NUL terminator
 } HwpSignReq;
 
 typedef struct {

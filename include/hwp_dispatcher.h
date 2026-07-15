@@ -35,6 +35,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "hwp.h"
 #include "orchard_signer.h"
 
 #ifdef __cplusplus
@@ -170,6 +171,30 @@ typedef struct HwpDispatcher {
     OrchardSignerCtx* signer;   /* caller-allocated, lifetime > dispatcher */
     bool testnet;
     void* user_ctx;             /* passed verbatim to every callback */
+    /* Frame TX scratch + RX parser. Embedded in the dispatcher rather than
+     * in static module storage so the TARGET decides where the memory
+     * lives: constrained targets (Flipper Zero) heap-allocate the whole
+     * HwpDispatcher for the session — keeping these buffers out of both
+     * the FAP image (loader budget) and the worker thread stack.
+     * hwp_dispatcher_run() (re)initialises the parser at entry; neither
+     * field needs caller setup.
+     *
+     * The TX buffer is deliberately small: the device only ever SENDS
+     * short frames (largest payload: FVK_RSP = 96 bytes, transparent
+     * SIGN_RSP ≈ 106; error strings are capped well below the limit).
+     * Only the RX parser needs a full HWP_MAX_PAYLOAD frame (the host
+     * streams 1.4 KB action payloads). send_frame() refuses payloads
+     * exceeding the TX cap instead of overflowing. */
+#ifndef HWP_DISPATCHER_MAX_TX_PAYLOAD
+#define HWP_DISPATCHER_MAX_TX_PAYLOAD 192
+#endif
+    uint8_t tx_buf[HWP_HEADER_SIZE + HWP_DISPATCHER_MAX_TX_PAYLOAD + HWP_CRC_SIZE];
+    HwpParser parser;
+    /* SIGN_REQ parse scratch. Lives here for the same reason as tx_buf:
+     * with HWP_MAX_RECIPIENT = 255 the struct is ~300 bytes, which blew
+     * handle_sign_req past the 512-byte per-function stack budget. Only
+     * valid while a SIGN_REQ frame is being handled. */
+    HwpSignReq sign_req;
 } HwpDispatcher;
 
 /* Run the dispatcher loop until io.should_exit() returns true or a

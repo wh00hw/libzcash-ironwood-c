@@ -23,10 +23,25 @@
  * MAX_ACTIONS * sizeof(OrchardActionDisplay) ≈ 16 * 52 = 832 bytes.
  *
  * Practically every Zcash wallet today produces 2..4 Orchard actions
- * per transaction; 16 is a generous ceiling that still fits comfortably
- * in 256 KB of SRAM.
+ * per transaction; the default of 16 is a generous ceiling for targets
+ * with room to spare (ESP32-class and hosts).
+ *
+ * RAM-constrained targets override this (and the other capacity
+ * tunables below) with compile definitions rather than by editing the
+ * library — the library stays generic and each consumer picks its own
+ * memory/capability trade-off. E.g. FlipZcash (application.fam):
+ *   cdefines=["ORCHARD_SIGNER_MAX_ACTIONS=8", "ORCHARD_SIGNER_MAX_MEMOS=4", ...]
+ * IMPORTANT: an override must be applied uniformly to every translation
+ * unit that includes this header (library AND application sources) —
+ * these constants shape struct layouts, so mixed values are an ABI
+ * mismatch. Overriding targets should also add a
+ * _Static_assert(sizeof(OrchardSignerCtx) <= <budget>, ...) next to
+ * their allocation so a future capacity bump fails the build instead of
+ * the device.
  */
+#ifndef ORCHARD_SIGNER_MAX_ACTIONS
 #define ORCHARD_SIGNER_MAX_ACTIONS 16
+#endif
 
 /**
  * Maximum number of transparent outputs the signer will capture for
@@ -35,7 +50,14 @@
  * generous for any realistic Zcash transaction (a typical shielded →
  * t-addr sweep produces exactly one transparent output).
  */
+#ifndef ORCHARD_SIGNER_MAX_T_OUTPUTS
 #define ORCHARD_SIGNER_MAX_T_OUTPUTS 8
+#endif
+
+/* Sanity bound: the action/output counters are uint16_t. Bounds for the
+ * memo-pool tunable are asserted next to its definition below. */
+_Static_assert(ORCHARD_SIGNER_MAX_ACTIONS >= 2 && ORCHARD_SIGNER_MAX_ACTIONS <= 65535,
+               "ORCHARD_SIGNER_MAX_ACTIONS must fit the uint16_t action counters");
 
 typedef enum {
     SIGNER_IDLE,                     /* Waiting for metadata */
@@ -136,29 +158,56 @@ typedef enum {
  * SIGNER_VERIFIED, which in turn prevents orchard_signer_sign() from
  * producing a signature — the "no blind signing" invariant.
  */
+/** No memo captured for this action (cmx-only feed path, or ZIP-302
+ *  empty memo). */
+#define ORCHARD_SIGNER_MEMO_NONE 0xFF
+
+/**
+ * Maximum number of NON-EMPTY memos captured per transaction. Memos are
+ * kept in a shared pool of 512-byte slots (rather than one buffer per
+ * action): ZIP-302 empty memos (0xF6 lead) are verified but occupy no
+ * slot, and a realistic transaction carries at most one or two
+ * memo-bearing outputs. A transaction with more memo-carrying outputs
+ * than slots is rejected at feed time with SIGNER_ERR_TOO_MANY_ACTIONS —
+ * never reviewed with a silently missing memo.
+ *
+ * The default (one slot per action) makes the pool semantically
+ * equivalent to per-action buffers. RAM-constrained targets override it
+ * downwards (see the override note on ORCHARD_SIGNER_MAX_ACTIONS);
+ * FlipZcash uses 4.
+ */
+#ifndef ORCHARD_SIGNER_MAX_MEMOS
+#define ORCHARD_SIGNER_MAX_MEMOS ORCHARD_SIGNER_MAX_ACTIONS
+#endif
+
+/* memo_slot is a uint8_t with 0xFF reserved as the "no memo" sentinel;
+ * a pool larger than the action ceiling is meaningless. */
+_Static_assert(ORCHARD_SIGNER_MAX_MEMOS >= 1 && ORCHARD_SIGNER_MAX_MEMOS <= 254,
+               "ORCHARD_SIGNER_MAX_MEMOS must be in 1..254 (uint8_t slot, 0xFF sentinel)");
+_Static_assert(ORCHARD_SIGNER_MAX_MEMOS <= ORCHARD_SIGNER_MAX_ACTIONS,
+               "memo pool larger than the action ceiling is meaningless");
+
 typedef struct {
     uint8_t recipient[43];   /* d[11] || pk_d[32] */
     uint64_t value;          /* output note value in zatoshis */
     bool confirmed;          /* set by orchard_signer_confirm_action() */
-    /* 512-byte memo plaintext, captured from feed_action_with_note_and_memo()
-     * after the on-device enc_ciphertext recomputation has verified it
-     * matches the action bytes. Empty (lead-byte 0xF6, rest unspecified)
-     * when no memo was supplied. Surfaced to the firmware UI via
-     * orchard_signer_get_action_memo() so the user can verify the memo
-     * contents on the trusted screen — without this step, a hostile
-     * companion could show one memo on its untrusted UI and declare a
-     * different (but cryptographically consistent) memo to the device.
-     *
-     * Set to all-zero when the action was fed via the cmx-only
-     * feed_action_with_note() path (no memo available).
+    /* Index into OrchardSignerCtx.memo_pool of the 512-byte memo plaintext
+     * captured from feed_action_with_note_and_memo() after the on-device
+     * enc_ciphertext recomputation verified it matches the action bytes —
+     * surfaced to the firmware UI via orchard_signer_get_action_memo() so
+     * the user can verify the memo on the trusted screen (without this, a
+     * hostile companion could show one memo on its untrusted UI and
+     * declare a different but cryptographically consistent one to the
+     * device). ORCHARD_SIGNER_MEMO_NONE when the action carried no
+     * displayable memo (cmx-only feed path, or ZIP-302 empty memo
+     * 0xF6-lead — nothing to show).
      *
      * Memo content interpretation follows ZIP-302:
      *   bytes[0] == 0xF6                 -> empty memo
      *   bytes[0] in 0x00..0xF4           -> UTF-8 text (trim trailing 0x00)
      *   bytes[0] == 0xF5 or 0xF7..0xFF   -> opaque / non-text
      */
-    uint8_t memo[512];
-    bool memo_present;       /* true iff feed_action_with_note_and_memo() captured a memo */
+    uint8_t memo_slot;
 } OrchardActionDisplay;
 
 /**
@@ -201,6 +250,11 @@ typedef struct {
      *  orchard_signer_verify() refuses to transition to VERIFIED unless every
      *  entry [0 .. actions_expected) has confirmed == true. */
     OrchardActionDisplay actions_display[ORCHARD_SIGNER_MAX_ACTIONS];
+    /** Shared pool of verified memo plaintexts referenced by
+     *  actions_display[].memo_slot. Only non-empty (non-0xF6-lead) memos
+     *  occupy a slot; see ORCHARD_SIGNER_MAX_MEMOS. */
+    uint8_t memo_pool[ORCHARD_SIGNER_MAX_MEMOS][512];
+    uint8_t memos_used;
     /** Per-transparent-output captured by feed_transparent_output(),
      *  consumed by the firmware UI via
      *  get_transparent_output_display(). Bounded; if a transaction

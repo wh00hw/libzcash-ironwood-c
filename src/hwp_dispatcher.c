@@ -41,28 +41,22 @@
 #include "base58.h"
 
 /* The dispatcher is documented single-threaded (one device, one host —
- * see hwp_dispatcher.h). Two pieces of scratch state would otherwise
- * blow the 512-byte per-function stack budget enforced on STM32-class
- * targets by scripts/check_stack.sh:
+ * see hwp_dispatcher.h). Its two big pieces of scratch state — the TX
+ * frame buffer and the RX parser (which embeds a full HwpFrame) — live
+ * INSIDE the HwpDispatcher struct: on the caller's stack they would blow
+ * the 512-byte per-function budget (scripts/check_stack.sh), and as
+ * static module storage they inflated the FAP image past the Flipper
+ * loader's free-heap budget. Embedding them lets each target choose the
+ * placement (the Flipper heap-allocates the dispatcher for the session).
  *
- *   - s_tx_buf: the 1032-byte HWP frame buffer used by send_frame and
- *     send_error. Sharing one file-scope buffer is safe because the
- *     two senders never run concurrently and neither retains a pointer
- *     past return.
- *   - s_parser: a HwpParser embeds a full HwpFrame (HWP_MAX_PAYLOAD =
- *     1024 bytes); keeping it on hwp_dispatcher_run's stack pushed
- *     that frame to ~3 KB.
- *
- * Every hwp_dispatcher_run() call re-initialises s_parser at entry, so
- * leftover state from a previous run cannot bleed into the next.
+ * hwp_dispatcher_run() re-initialises the parser at entry, so leftover
+ * state from a previous run cannot bleed into the next.
  *
  * Per-message handlers below are also marked noinline: at -O2 GCC was
  * folding their locals (sign-req scratch, per-output review buffers,
  * fvk payload, ECDSA scratch) into hwp_dispatcher_run's frame, and the
  * sum tripped the per-function limit even though no single handler
  * does. Forcing separate frames keeps each one comfortably under 512. */
-static uint8_t s_tx_buf[HWP_MAX_FRAME];
-static HwpParser s_parser;
 
 #define HWP_NOINLINE __attribute__((noinline))
 
@@ -71,14 +65,20 @@ static HwpParser s_parser;
 static HWP_NOINLINE void send_frame(HwpDispatcher* d, uint8_t seq,
                                      uint8_t msg_type,
                                      const uint8_t* payload, uint16_t len) {
-    size_t frame_len = hwp_encode(s_tx_buf, seq, msg_type, payload, len);
-    d->io.serial_send(s_tx_buf, frame_len, d->user_ctx);
+    if(len > HWP_DISPATCHER_MAX_TX_PAYLOAD) {
+        /* Structurally impossible for the frames this dispatcher emits
+         * (see tx_buf sizing note in hwp_dispatcher.h); refuse rather
+         * than overflow if a future message type outgrows the cap. */
+        return;
+    }
+    size_t frame_len = hwp_encode(d->tx_buf, seq, msg_type, payload, len);
+    d->io.serial_send(d->tx_buf, frame_len, d->user_ctx);
 }
 
 static HWP_NOINLINE void send_error(HwpDispatcher* d, uint8_t seq,
                                      HwpErrorCode code, const char* msg) {
-    size_t frame_len = hwp_encode_error(s_tx_buf, seq, code, msg);
-    d->io.serial_send(s_tx_buf, frame_len, d->user_ctx);
+    size_t frame_len = hwp_encode_error(d->tx_buf, seq, code, msg);
+    d->io.serial_send(d->tx_buf, frame_len, d->user_ctx);
     /* Make the error visible in the persistent UI footer. The actual
      * error code/message already went over the wire to the host. */
     if(d->ui.phase_update) {
@@ -605,13 +605,16 @@ static HWP_NOINLINE void handle_transparent_sign_req(HwpDispatcher* d,
 static HWP_NOINLINE void handle_sign_req(HwpDispatcher* d, HwpFrame* f,
                                           bool* user_confirmed,
                                           uint16_t* sign_req_seen) {
-    HwpSignReq req;
-    if(!hwp_parse_sign_req(f->payload, f->payload_len, &req)) {
+    /* Parse into the dispatcher-embedded scratch: with the 255-byte
+     * recipient the struct no longer fits the per-function stack budget
+     * (see the field's note in hwp_dispatcher.h). */
+    HwpSignReq* req = &d->sign_req;
+    if(!hwp_parse_sign_req(f->payload, f->payload_len, req)) {
         send_error(d, f->seq, HWP_ERR_BAD_SIGHASH, "Invalid SIGN_REQ payload");
         return;
     }
 
-    OrchardSignerError chk = orchard_signer_check(d->signer, req.sighash);
+    OrchardSignerError chk = orchard_signer_check(d->signer, req->sighash);
     if(chk == SIGNER_ERR_NOT_VERIFIED) {
         send_error(d, f->seq, HWP_ERR_INVALID_STATE,
                    "ZIP-244 verification not completed");
@@ -637,7 +640,7 @@ static HWP_NOINLINE void handle_sign_req(HwpDispatcher* d, HwpFrame* f,
          * and rejected every transparent recipient as a network
          * mismatch. The transparent digest the device already verified
          * is what binds SIGN_REQ.recipient to the actual sent funds. */
-        const char* r = req.recipient;
+        const char* r = req->recipient;
         bool is_shielded;
         bool addr_is_testnet;
         if(r[0] == 'u') {
@@ -692,7 +695,7 @@ static HWP_NOINLINE void handle_sign_req(HwpDispatcher* d, HwpFrame* f,
         }
 
         phase(d, HWP_PHASE_AWAIT_CONFIRM, 0, d->signer->actions_received);
-        HwpUiResult uir = d->ui.confirm_tx(req.amount, req.fee, req.recipient,
+        HwpUiResult uir = d->ui.confirm_tx(req->amount, req->fee, req->recipient,
                                             d->user_ctx);
         if(uir != HWP_UI_OK) {
             send_error(d, f->seq, HWP_ERR_USER_CANCELLED, "User cancelled");
@@ -709,7 +712,7 @@ static HWP_NOINLINE void handle_sign_req(HwpDispatcher* d, HwpFrame* f,
 
     uint8_t sig[64], rk[32];
     OrchardSignerError serr = orchard_signer_sign(
-        d->signer, req.sighash, d->keys.ask, req.alpha, sig, rk);
+        d->signer, req->sighash, d->keys.ask, req->alpha, sig, rk);
     if(serr != SIGNER_OK) {
         send_error(d, f->seq, HWP_ERR_SIGN_FAILED, "RedPallas sign failed");
         return;
@@ -776,8 +779,8 @@ HwpDispatchResult hwp_dispatcher_run(HwpDispatcher* d) {
         return HWP_DISP_FATAL;
     }
 
-    hwp_parser_init(&s_parser);
-    ParseCtx pc = {.parser = &s_parser, .last_result = HWP_FEED_INCOMPLETE,
+    hwp_parser_init(&d->parser);
+    ParseCtx pc = {.parser = &d->parser, .last_result = HWP_FEED_INCOMPLETE,
                    .carryover_count = 0};
 
     uint8_t seq = 0;
@@ -855,7 +858,7 @@ HwpDispatchResult hwp_dispatcher_run(HwpDispatcher* d) {
            (now - last_rx_tick) > IDLE_RESET_MS &&
            d->signer->state == SIGNER_IDLE) {
             connected = false;
-            hwp_parser_init(&s_parser);
+            hwp_parser_init(&d->parser);
             pc.last_result = HWP_FEED_INCOMPLETE;
             pc.carryover_count = 0;
             phase(d, HWP_PHASE_IDLE, 0, 0);
@@ -870,14 +873,14 @@ HwpDispatchResult hwp_dispatcher_run(HwpDispatcher* d) {
 
         if(pc.last_result == HWP_FEED_CRC_ERROR) {
             send_error(d, 0, HWP_ERR_BAD_FRAME, "CRC mismatch");
-            hwp_parser_init(&s_parser);
+            hwp_parser_init(&d->parser);
             pc.last_result = HWP_FEED_INCOMPLETE;
             pc.carryover_count = 0;
             continue;
         }
         if(pc.last_result != HWP_FEED_FRAME_READY) continue;
 
-        HwpFrame* f = &s_parser.frame;
+        HwpFrame* f = &d->parser.frame;
         connected = true;
         last_rx_tick = now;
 
@@ -885,7 +888,7 @@ HwpDispatchResult hwp_dispatcher_run(HwpDispatcher* d) {
         if(f->version != HWP_VERSION && f->version != 0x01) {
             send_error(d, f->seq, HWP_ERR_UNSUPPORTED_VER,
                        "Unsupported protocol version");
-            hwp_parser_init(&s_parser);
+            hwp_parser_init(&d->parser);
             pc.last_result = HWP_FEED_INCOMPLETE;
             continue;
         }
@@ -928,7 +931,7 @@ HwpDispatchResult hwp_dispatcher_run(HwpDispatcher* d) {
 
         /* After handling a frame, the parser is "done" with it — reset
          * state so the next byte starts the next frame. */
-        hwp_parser_init(&s_parser);
+        hwp_parser_init(&d->parser);
         pc.last_result = HWP_FEED_INCOMPLETE;
     }
 

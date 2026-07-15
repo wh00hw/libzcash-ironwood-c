@@ -174,7 +174,12 @@ bool hwp_parse_sign_req(const uint8_t* payload, uint16_t len, HwpSignReq* out) {
     out->fee = 0;
     for(int i = 7; i >= 0; i--) out->fee = (out->fee << 8) | payload[72 + i];
     out->recipient_len = payload[80];
-    if(out->recipient_len > 127) return false;
+    /* recipient_len is a single wire byte (<= 255). The bound check is only
+     * meaningful for a cap below that; guarding it keeps -Werror=type-limits
+     * happy when HWP_MAX_RECIPIENT == 255 (the check would always be false). */
+#if HWP_MAX_RECIPIENT < 255
+    if(out->recipient_len > HWP_MAX_RECIPIENT) return false;
+#endif
     if(len < HWP_SIGN_REQ_FIXED + out->recipient_len) return false;
     memcpy(out->recipient, payload + HWP_SIGN_REQ_FIXED, out->recipient_len);
     out->recipient[out->recipient_len] = '\0';
