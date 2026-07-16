@@ -2,6 +2,7 @@
 #include "pallas.h"
 #include "redpallas.h"
 #include "bip39.h"
+#include "chacha20poly1305.h"
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
@@ -97,8 +98,14 @@ static void test_sign_verify_roundtrip(void) {
     printf("  PASS: sign roundtrip (signature produced)\n");
 }
 
+static void test_chacha20poly1305(void) {
+    assert(chacha20poly1305_self_test() == 1);
+    printf("  PASS: ChaCha20-Poly1305 self-test (RFC 7539 vector + tamper detection)\n");
+}
+
 int main(void) {
     printf("Orchard crypto tests:\n");
+    test_chacha20poly1305();
     test_key_derivation();
     test_sign_verify_roundtrip();
     test_address_derivation();

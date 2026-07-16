@@ -284,9 +284,11 @@ bool hwp_parse_tx_output(const uint8_t* payload, uint16_t len, HwpTxOutput* out)
 bool hwp_parse_action_v4(const uint8_t* output_data, uint16_t output_data_len,
                          HwpActionV4* out);
 
-// Split a v5 action+full-note-plaintext+memo+esk output_data block
-// (HWP_ACTION_DATA_SIZE_V5 = 1447 bytes) into its constituents. Returns
+// Split a v5 action+full-note-plaintext+memo output_data block
+// (HWP_ACTION_DATA_SIZE_V5 = 1415 bytes) into its constituents. Returns
 // true on success, false if the data length is not exactly that.
+// esk is NOT on the wire: the device derives it on-chip from rseed +
+// the action's nullifier (= rho) per ZIP-212.
 bool hwp_parse_action_v5(const uint8_t* output_data, uint16_t output_data_len,
                          HwpActionV5* out);
 

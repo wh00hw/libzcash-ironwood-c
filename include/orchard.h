@@ -240,7 +240,7 @@ void orchard_compute_cmx(
  *   epk          = [esk]·g_d                                 (Pallas pt)
  *   SharedSecret = [esk]·pk_d                                (Pallas pt)
  *   K_enc        = BLAKE2b-256("Zcash_OrchardKDF",
- *                              repr_P(epk) || repr_P(ss))
+ *                              repr_P(ss) || repr_P(epk))
  *   np           = leadByte || d(11) || value_LE(8) ||
  *                  rseed(32) || memo(512)                    (564 bytes)
  *   enc_ciphertext = ChaCha20-Poly1305_Encrypt(K_enc, nonce=0, np)

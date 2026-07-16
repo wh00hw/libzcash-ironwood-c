@@ -347,8 +347,8 @@ OrchardSignerError orchard_signer_feed_action_with_note(
 
 /**
  * Feed one action together with the FULL note plaintext (including the
- * 512-byte memo and the 32-byte ephemeral secret `esk`), and verify both
- * the cmx and the enc_ciphertext on-device.
+ * 512-byte memo), and verify both the cmx and the enc_ciphertext
+ * on-device. The ephemeral secret `esk` is derived on-chip (see below).
  *
  * This is the stronger variant of feed_action_with_note(). The cmx check
  * binds (d, pk_d, value, rho, rseed) but is silent about the memo bytes:
@@ -363,8 +363,9 @@ OrchardSignerError orchard_signer_feed_action_with_note(
  *   2. Recompute the 580-byte enc_ciphertext via:
  *        epk          = [esk]·g_d
  *        SharedSecret = [esk]·pk_d
- *        K_enc        = BLAKE2b("Zcash_OrchardKDF", repr_P(epk)||repr_P(ss))
- *        np           = leadByte(0x02)||d||value_LE||rseed||memo  (564 B)
+ *        K_enc        = BLAKE2b("Zcash_OrchardKDF", repr_P(ss)||repr_P(epk))
+ *        np           = leadByte||d||value_LE||rseed||memo  (564 B)
+ *                       (leadByte 0x02 = Orchard V2, 0x03 = Ironwood V3)
  *        enc_ciphertext = ChaCha20-Poly1305_Encrypt(K_enc, IV=0, np)
  *      and constant-time compare against the action's enc_ciphertext
  *      field (offset 160, 580 B). Mismatch → SIGNER_ERR_MEMO_MISMATCH,
@@ -389,7 +390,7 @@ OrchardSignerError orchard_signer_feed_action_with_note(
  *   SIGNER_ERR_MEMO_MISMATCH             enc_ciphertext (and/or epk) does
  *                                        not match what the device
  *                                        recomputed from the supplied
- *                                        memo + esk
+ *                                        memo (esk derived on-chip)
  *
  * On any mismatch error the context is reset to IDLE so a partial
  * session cannot be reused.
