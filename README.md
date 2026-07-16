@@ -28,6 +28,7 @@ Implements key derivation, address generation, RedPallas signing, ECDSA transpar
 - **Unified Address encoding from arbitrary recipients** — `orchard_encode_ua_raw(d, pk_d, hrp)` produces the canonical ZIP-316 Bech32m string for an Orchard payment address that is *not* the device's own — needed to render the recipient of every output to the user before they confirm
 - **Signing context** (`orchard_signer.h`) — library-level state machine that composes all of the above: a signature is only producible after sapling-empty + per-action cmx + per-action enc_ciphertext + per-action user confirmation + per-tx fee confirmation + sighash match all pass
 - **Hardware Wallet Protocol v2/v3/v4/v5/v6** — framed binary serial protocol with CRC-16, incremental sighash verification, transparent digest verification, transparent ECDSA signing, and memo-verifying action payloads. The wire version byte stays `0x02`; v3–v6 are feature tiers discriminated by payload size and `TxMeta` layout. v5 action payload: 1415 B = action ‖ recipient ‖ value ‖ rseed ‖ memo (esk never on the wire). v6 (NU6.3/Ironwood) prepends a 1-byte pool tag (`0x00` sealed Orchard, `0x01` Ironwood): 1416 B full / 904 B compact; v6 sessions are recognised by the 166/170-byte `TxMeta` layout. `HWP_MAX_PAYLOAD` defaults to 2048 (compile-time overridable, minimum 1420). Compatible with [zcash-hw-wallet-sdk](https://github.com/wh00hw/zcash-hw-wallet-sdk) (Rust); v4 payloads (903 B, cmx-only) still accepted for backward compatibility when memo recovery is not available on the host side.
+- **Device attestation (HWP v4, audit M1)** — identity + challenge/response messages (`HWP_MSG_IDENTITY_REQ/RSP` `0x0F`/`0x10`, `HWP_MSG_ATTEST_REQ/RSP` `0x11`/`0x12`): the host sends a fresh 32-byte challenge, the device signs it with a domain-separated RedPallas signature (`orchard_sign_with_personal`, personalization `"ZcashHWAttestV1!"`) so a paired host can pin the device identity pubkey and detect device substitution
 - **Target-agnostic protocol dispatcher** (`hwp_dispatcher.h`) — the entire device-side state machine (drain → parse → switch → reply, PING/PONG keepalive, IDLE detection, multi-frame drain handling, per-output review orchestration, recipient binding) is contained in the library and exposed through a callback-based API. A new device target wires up six I/O callbacks (`serial_drain`, `serial_send`, `get_tick_ms`, `sleep_ms`, `should_exit`, plus UI callbacks for review/confirm) and gets the full protocol implementation for free. The same code runs on FlipZcash, the virtual-device test fixture, and future ESP32 / BOLOS ports — fix once, benefit everywhere.
 - **Transparent t-address rendering on-device** (`base58.h`) — `script_to_taddr()` decodes a P2PKH or P2SH `script_pubkey` to the corresponding Zcash t-address string (mainnet `t1`/`t3`, testnet `tm`/`t2`) via Base58Check encoding. Lets the device display the actual destination of a transparent output (e.g. on a shielded → t-addr sweep) instead of only the change Orchard receivers, extending the no-blind-signing invariant to transparent recipients.
 - **BIP39 mnemonic** — generation and seed derivation (PBKDF2-HMAC-SHA512) with an optional progress callback (`pbkdf2_set_progress_cb`) so the UI can drive a bar during multi-second PIN-derived KDF.
@@ -44,7 +45,7 @@ Implements key derivation, address generation, RedPallas signing, ECDSA transpar
 | ARM Cortex-M (STM32, nRF52, ...) | Portable | Provide `random32()` via HW RNG peripheral |
 | Flipper Zero | Portable | Provide `random32()` via `furi_hal_random_get()`, optional Sinsemilla table via storage API |
 | RISC-V (GD32V, ESP32-C3) | Portable | Provide `random32()`, compile with GCC |
-| Linux / macOS (testing) | Works | Uses LCG fallback (test only, **not secure**) |
+| Linux / macOS (testing) | Works | Opt in to the insecure LCG fallback with `-DUSE_PLATFORM_RNG=0 -DZORCHARD_INSECURE_LCG=1` (test only, **not secure**) |
 
 ## Platform security considerations
 
@@ -75,24 +76,32 @@ make
 
 ### Build options
 
+CMake options:
+
 | Option | Default | Description |
 |--------|---------|-------------|
 | `BUILD_TESTS` | `ON` | Build test suite |
-| `USE_PLATFORM_RNG` | `0` | Expect platform-provided `random32()`/`random_buffer()` at link time |
+| `STACK_ANALYSIS` | `OFF` | Enable `-fstack-usage` for stack bound analysis (GCC only; see `scripts/check_stack.sh`) |
 
-Override at compile time:
+Compile-time macros (`include/options.h`, overridable via `CMAKE_C_FLAGS`):
+
+| Macro | Default | Description |
+|-------|---------|-------------|
+| `USE_PLATFORM_RNG` | `1` | Expect platform-provided `random32()`/`random_buffer()` at link time (audit C-2). Setting it to `0` is refused at compile time unless `ZORCHARD_INSECURE_LCG=1` is also defined — the insecure LCG fallback is an explicit, test-only opt-in. |
+
+Example — test build against the deterministic LCG (never in production):
 
 ```bash
-cmake .. -DCMAKE_C_FLAGS="-DUSE_PLATFORM_RNG=1"
+cmake .. -DCMAKE_C_FLAGS="-DUSE_PLATFORM_RNG=0 -DZORCHARD_INSECURE_LCG=1"
 ```
 
 ## Porting to your hardware
 
 ### 1. Implement `random32()` (required)
 
-The library ships with a **non-cryptographic LCG fallback** for testing. You **must** replace it with your platform's hardware RNG for production use.
+The library expects a platform hardware RNG by default (`USE_PLATFORM_RNG=1` in `options.h`): a build that does not provide `random32()`/`random_buffer()` fails at link time. A **non-cryptographic LCG fallback** exists for deterministic tests only, behind the explicit double opt-in `USE_PLATFORM_RNG=0` + `ZORCHARD_INSECURE_LCG=1` — the library refuses to compile against the LCG otherwise.
 
-Define `USE_PLATFORM_RNG=1` and provide your own implementations at link time:
+Provide your own implementations at link time:
 
 ```c
 uint32_t random32(void);
@@ -183,6 +192,8 @@ This keeps the firmware image small and uses almost no RAM — only 64 bytes per
 | A — Compute on-the-fly | 0 | 0 | Slow | Extremely constrained MCUs |
 | B — Header in flash | 0 (const) | 32–64 KB flash | Fast | MCUs with enough flash |
 | C — Binary from SD/ROM | 64 B | 64 KB external | Fast | Devices with external storage |
+
+> **Table integrity (audit M-5):** any target that registers a lookup callback (strategies B/C) **must** call `pallas_verify_sinsemilla_table()` once at boot, before the first Sinsemilla operation. It checks a BLAKE2b digest over all 1024 entries (~10 ms on a 240 MHz core); a `false` return means the stored table was altered (supply-chain attack, fault injection, storage corruption) and the device must refuse to operate.
 
 ### 3. Platform callbacks (optional)
 
@@ -283,11 +294,20 @@ include/
   hmac.h                — HMAC-SHA-256 / HMAC-SHA-512
   pbkdf2.h              — PBKDF2-HMAC-SHA-512
   rand.h                — RNG abstraction (pluggable backend)
+  memzero.h             — Compiler-resistant secure memory wipe
   segwit_addr.h         — Bech32 / Bech32m encoding
 
 src/
   aes/             — AES-256 (pure C, no hardware intrinsics)
-  sinsemilla_s.bin — Precomputed Sinsemilla S-table (64 KB)
+  sinsemilla_s.h   — Precomputed Sinsemilla S-table, compressed (32 KB static const, strategy B)
+  sinsemilla_s.bin — Precomputed Sinsemilla S-table, decompressed (64 KB, strategy C)
+
+tools/
+  gen_test_vectors/     — Rust generator for the Orchard KAT corpus (vs librustzcash)
+  gen_ironwood_vectors/ — Rust generator for the NU6.3 / Ironwood vectors
+
+scripts/
+  check_stack.sh   — Per-function stack bound analysis (with STACK_ANALYSIS=ON)
 ```
 
 ### Extension points
@@ -318,7 +338,7 @@ For every component of the v5 (four-leaf) or v6 (five-leaf, NU6.3/Ironwood) shie
 
 Hashing the encrypted action stream is not enough by itself: the cmx field of an action is opaque to the hashing path, so a hostile companion could put a cmx that commits to `(attacker_address, value)` while telling the device's UI "send to <Mario>". Defence: the device recomputes the cmx from the unencrypted note plaintext the companion declares, and rejects the action if the recomputation does not match the cmx in the action bytes.
 
-`orchard_signer_feed_action_with_note(ctx, pool, action, recipient, value, rseed)` computes:
+`orchard_signer_feed_action_with_note(ctx, pool, action, action_len, recipient, value, rseed)` computes:
 
 ```
 g_d = DiversifyHash(d)
@@ -340,7 +360,7 @@ with `rho` taken from the action's nullifier field (Orchard's split-action desig
 
 cmx recomputation closes recipient + value substitution, but the cmx domain does not cover the memo bytes: a host that has been forced through cmx-recomputation can still embed any 512-byte memo plaintext inside `enc_ciphertext` while showing the user something different on its untrusted UI. The recipient sees the attacker's memo on chain.
 
-`orchard_signer_feed_action_with_note_and_memo(ctx, pool, action, recipient, value, rseed, memo)` therefore additionally recomputes the 580-byte AEAD ciphertext from the unencrypted note plaintext:
+`orchard_signer_feed_action_with_note_and_memo(ctx, pool, action, action_len, recipient, value, rseed, memo)` therefore additionally recomputes the 580-byte AEAD ciphertext from the unencrypted note plaintext:
 
 ```
 g_d          = DiversifyHash(d)

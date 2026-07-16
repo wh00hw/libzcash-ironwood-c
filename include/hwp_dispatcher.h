@@ -15,7 +15,7 @@
  *
  *   HwpDispatcher d = {
  *       .io = { .serial_drain = my_cdc_drain, ... },
- *       .ui = { .review_action = my_review_screen, ... },
+ *       .ui = { .review_output = my_review_screen, ... },
  *       .keys = { .ak = ak, .nk = nk, .rivk = rivk, .ask = ask, ... },
  *       .signer = &signer,
  *       .testnet = is_testnet,
