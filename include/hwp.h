@@ -6,6 +6,12 @@
  * Compatible with zcash-hw-wallet-sdk (Rust).
  * Supports staged transaction verification: outputs are sent individually
  * and hashed incrementally on-device to verify sighash integrity before signing.
+ *
+ * v6-only (post-NU6.3 / Ironwood): the device accepts ONLY the v6 wire tier
+ * — 166/170-byte TxMeta and pool-tagged action payloads (904 / 1416 bytes).
+ * Legacy pre-v6 layouts (125/129-byte TxMeta, untagged 903/1415-byte
+ * actions) are rejected. The frame VERSION byte (0x02) is unrelated to the
+ * wire tier and is unchanged.
  */
 #pragma once
 #include <stdint.h>
@@ -37,39 +43,39 @@ _Static_assert(HWP_MAX_PAYLOAD >= 1420,
 // cv_net(32) + nullifier(32) + rk(32) + cmx(32) + ephemeral_key(32) + enc_ciphertext(580) + out_ciphertext(80)
 #define HWP_ACTION_DATA_SIZE 820
 
-// Note plaintext appended to action data for on-device cmx verification (v4):
+// Note plaintext appended to action data for on-device cmx verification:
 // recipient(43) + value(8 LE) + rseed(32) = 83 bytes
 // Required so the device can recompute the action's NoteCommitment and reject
-// recipient-substitution attacks. Total TX_OUTPUT action payload = 820 + 83 = 903.
+// recipient-substitution attacks.
 #define HWP_NOTE_PLAINTEXT_SIZE  83
-#define HWP_ACTION_DATA_SIZE_V4  (HWP_ACTION_DATA_SIZE + HWP_NOTE_PLAINTEXT_SIZE)
 
-// Full note plaintext for v5 (memo-verifying) protocol:
-// recipient(43) + value(8) + rseed(32) + memo(512) = 595 bytes
-// Total TX_OUTPUT action payload for v5 = 820 + 595 = 1415 bytes.
+// v6 (NU6.3 / Ironwood) action payloads — the ONLY layouts this library
+// accepts. A 1-byte pool tag (0x00 = sealed Orchard pool, 0x01 = Ironwood
+// pool) is prefixed to the action body; the dispatcher strips the tag and
+// routes the action into the matching ZIP-244 pool digest tree.
 //
-// The device uses recipient/value/rseed/memo to recompute the action's
-// `enc_ciphertext` byte-for-byte; mismatch aborts the session. Closes the
-// memo-substitution attack that v4 (cmx-only) leaves open.
+// Tag-stripped body layouts:
+//   compact (cmx-only):   action(820) + recipient(43) + value(8) + rseed(32)
+//                         = 903 bytes
+//   memo-verifying:       compact body + memo(512) = 1415 bytes
 //
-// `esk` is NOT on the wire: per ZIP-212 it is a deterministic function
-// of rseed + rho (= action's nullifier), so the device derives it on-chip
-// from the same inputs the companion already supplies. Keeping esk off
-// the wire removes one trust-from-companion vector.
-#define HWP_NOTE_PLAINTEXT_V5_SIZE  (HWP_NOTE_PLAINTEXT_SIZE + 512)
-#define HWP_ACTION_DATA_SIZE_V5  (HWP_ACTION_DATA_SIZE + HWP_NOTE_PLAINTEXT_V5_SIZE)
-
-// v6 (NU6.3 / Ironwood) action payloads: a 1-byte pool tag (0x00 = sealed
-// Orchard pool, 0x01 = Ironwood pool) prefixed to the v4 or v5 payload.
-// The dispatcher strips the tag and routes the action into the matching
-// ZIP-244 pool digest tree; the remaining bytes reuse the v4/v5 layouts.
+// With the memo-verifying body the device uses recipient/value/rseed/memo
+// to recompute the action's `enc_ciphertext` byte-for-byte; mismatch aborts
+// the session. Closes the memo-substitution attack that the cmx-only body
+// leaves open. `esk` is NOT on the wire: per ZIP-212 it is a deterministic
+// function of rseed + rho (= action's nullifier), so the device derives it
+// on-chip from the same inputs the companion already supplies.
+//
+// On-the-wire payload sizes (pool tag included):
 //   memo-verifying: 1 + 1415 = 1416 bytes
 //   cmx-only:       1 + 903  = 904 bytes
-// v6 sessions are recognized by the TxMeta layout (170/166 bytes, with the
-// Ironwood bundle section); v5 sessions carry no pool tag.
+// Legacy untagged v4/v5 payloads (903/1415 bytes) are rejected by the
+// dispatcher — post-NU6.3 every action must carry a pool tag.
 #define HWP_POOL_TAG_SIZE 1
-#define HWP_ACTION_DATA_SIZE_V6         (HWP_POOL_TAG_SIZE + HWP_ACTION_DATA_SIZE_V5)
-#define HWP_ACTION_DATA_SIZE_V6_COMPACT (HWP_POOL_TAG_SIZE + HWP_ACTION_DATA_SIZE_V4)
+#define HWP_ACTION_BODY_COMPACT_SIZE (HWP_ACTION_DATA_SIZE + HWP_NOTE_PLAINTEXT_SIZE) /* 903 */
+#define HWP_ACTION_BODY_MEMO_SIZE    (HWP_ACTION_BODY_COMPACT_SIZE + 512)             /* 1415 */
+#define HWP_ACTION_DATA_SIZE_V6         (HWP_POOL_TAG_SIZE + HWP_ACTION_BODY_MEMO_SIZE)    /* 1416 */
+#define HWP_ACTION_DATA_SIZE_V6_COMPACT (HWP_POOL_TAG_SIZE + HWP_ACTION_BODY_COMPACT_SIZE) /* 904 */
 
 // TxOutput special indices for v2 sighash verification protocol:
 // 0xFFFF = transaction metadata (header + orchard bundle info, 61 bytes)
@@ -178,14 +184,15 @@ typedef struct {
 } HwpTxOutput;
 
 /**
- * View of a TX_OUTPUT action payload (v4 format) split into the on-the-wire
+ * View of a tag-stripped v6 compact (cmx-only) action body split into the
  * 820-byte action data and the appended 83-byte note plaintext.
  *
- *   wire_payload[output_data] = action[820] || recipient[43] || value[8 LE] || rseed[32]
+ *   body = action[820] || recipient[43] || value[8 LE] || rseed[32]   (903 B)
  *
  * Pointers reference the original payload buffer (no copy). The device uses
  * `recipient`/`value`/`rseed` to recompute the action's NoteCommitment and
  * compares against `action[OFF_CMX]`. See `orchard_signer_feed_action_with_note`.
+ * (The struct keeps its historical V4 name; the layout is byte-identical.)
  */
 typedef struct {
     const uint8_t* action;       /* HWP_ACTION_DATA_SIZE = 820 bytes */
@@ -195,16 +202,17 @@ typedef struct {
 } HwpActionV4;
 
 /**
- * View of a TX_OUTPUT action payload (v5 format) — same as v4 plus the
- * 512-byte memo plaintext. The device uses these to recompute the action's
- * `enc_ciphertext` and `ephemeral_key`, closing the memo-substitution
- * attack that v4 leaves open (cmx alone binds value/recipient but not memo
- * bytes). `esk` is derived on-device from `rseed + rho` per ZIP-212.
+ * View of a tag-stripped v6 memo-verifying action body — same as the
+ * compact body plus the 512-byte memo plaintext. The device uses these to
+ * recompute the action's `enc_ciphertext` and `ephemeral_key`, closing the
+ * memo-substitution attack that the cmx-only body leaves open (cmx alone
+ * binds value/recipient but not memo bytes). `esk` is derived on-device
+ * from `rseed + rho` per ZIP-212.
  *
- *   wire_payload[output_data] =
- *     action[820] || recipient[43] || value[8 LE] || rseed[32] || memo[512]
+ *   body = action[820] || recipient[43] || value[8 LE] || rseed[32] || memo[512]   (1415 B)
  *
  * Pointers reference the original payload buffer (no copy).
+ * (The struct keeps its historical V5 name; the layout is byte-identical.)
  */
 typedef struct {
     const uint8_t* action;       /* HWP_ACTION_DATA_SIZE = 820 bytes */
@@ -278,14 +286,14 @@ uint16_t hwp_encode_sign_req(uint8_t* payload, const HwpSignReq* req);
 // Note: output_data points into the payload buffer (not copied).
 bool hwp_parse_tx_output(const uint8_t* payload, uint16_t len, HwpTxOutput* out);
 
-// Split a v4 action+note-plaintext output_data block (HWP_ACTION_DATA_SIZE_V4
+// Split a tag-stripped v6 compact action body (HWP_ACTION_BODY_COMPACT_SIZE
 // = 903 bytes) into its constituents. Returns true on success, false if the
-// data length is not exactly HWP_ACTION_DATA_SIZE_V4.
+// data length is not exactly HWP_ACTION_BODY_COMPACT_SIZE.
 bool hwp_parse_action_v4(const uint8_t* output_data, uint16_t output_data_len,
                          HwpActionV4* out);
 
-// Split a v5 action+full-note-plaintext+memo output_data block
-// (HWP_ACTION_DATA_SIZE_V5 = 1415 bytes) into its constituents. Returns
+// Split a tag-stripped v6 memo-verifying action body
+// (HWP_ACTION_BODY_MEMO_SIZE = 1415 bytes) into its constituents. Returns
 // true on success, false if the data length is not exactly that.
 // esk is NOT on the wire: the device derives it on-chip from rseed +
 // the action's nullifier (= rho) per ZIP-212.

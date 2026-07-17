@@ -28,6 +28,9 @@ OrchardSignerError orchard_signer_feed_meta(OrchardSignerCtx *ctx,
         return SIGNER_ERR_BAD_STATE;
     }
 
+    /* v6-only (post-NU6.3): zip244_parse_tx_meta accepts exactly the
+     * 166/170-byte v6 layouts. Legacy 125/129-byte v5 metas (and any
+     * other length) fail the parse and are rejected here. */
     if (!zip244_parse_tx_meta(meta_data, meta_len, &ctx->tx_meta)) {
         return SIGNER_ERR_BAD_META;
     }
@@ -63,27 +66,24 @@ OrchardSignerError orchard_signer_feed_meta(OrchardSignerCtx *ctx,
         return SIGNER_ERR_TOO_MANY_ACTIONS;
     }
 
-    if (ctx->tx_meta.is_v6) {
-        /* v6 (NU6.3 / Ironwood) consistency + policy checks:
-         *  - the header version/version-group-id must be the v6 constants
-         *    (a v6-layout TxMeta with a v5 header would let a companion
-         *    pick personalizations that don't match the encoded tx);
-         *  - the sealed Orchard pool's flag byte must have bit 2 clear —
-         *    consensus mandates the cross-address restriction post-NU6.3 —
-         *    and no reserved bits set;
-         *  - the Ironwood flag byte may use bits 0..2 only
-         *    (enableSpends / enableOutputs / enableCrossAddress). */
-        if (ctx->tx_meta.version != ZIP244_V6_TX_VERSION ||
-            ctx->tx_meta.version_group_id != ZIP244_V6_VERSION_GROUP_ID ||
-            (ctx->tx_meta.orchard_flags & ~0x03u) != 0 ||
-            (ctx->tx_meta.ironwood_flags & ~0x07u) != 0) {
-            memzero(&ctx->tx_meta, sizeof(ctx->tx_meta));
-            return SIGNER_ERR_BAD_META;
-        }
+    /* v6 (NU6.3 / Ironwood) consistency + policy checks:
+     *  - the header version/version-group-id must be the v6 constants
+     *    (a v6-layout TxMeta with a pre-v6 header would let a companion
+     *    pick personalizations that don't match the encoded tx);
+     *  - the sealed Orchard pool's flag byte must have bit 2 clear —
+     *    consensus mandates the cross-address restriction post-NU6.3 —
+     *    and no reserved bits set;
+     *  - the Ironwood flag byte may use bits 0..2 only
+     *    (enableSpends / enableOutputs / enableCrossAddress). */
+    if (ctx->tx_meta.version != ZIP244_V6_TX_VERSION ||
+        ctx->tx_meta.version_group_id != ZIP244_V6_VERSION_GROUP_ID ||
+        (ctx->tx_meta.orchard_flags & ~0x03u) != 0 ||
+        (ctx->tx_meta.ironwood_flags & ~0x07u) != 0) {
+        memzero(&ctx->tx_meta, sizeof(ctx->tx_meta));
+        return SIGNER_ERR_BAD_META;
     }
 
-    zip244_actions_init_pool(&ctx->actions_state, ZIP244_POOL_ORCHARD,
-                             ctx->tx_meta.is_v6);
+    zip244_actions_init_pool(&ctx->actions_state, ZIP244_POOL_ORCHARD, true);
     zip244_actions_init_pool(&ctx->ironwood_actions_state, ZIP244_POOL_IRONWOOD,
                              true);
     ctx->has_meta = true;
@@ -250,15 +250,16 @@ OrchardSignerError orchard_signer_verify_transparent(OrchardSignerCtx *ctx,
 /*  Orchard action feed                                               */
 /* ------------------------------------------------------------------ */
 
-/* Route an action to the digest state of its pool. Ironwood actions are
- * only valid inside v6 transactions; unknown pool bytes are rejected. */
+/* Route an action to the digest state of its pool. Every session is v6
+ * (feed_meta rejects anything else), so both pools are always valid;
+ * unknown pool bytes are rejected. */
 static Zip244ActionsState* signer_pool_state(OrchardSignerCtx *ctx, Zip244Pool pool)
 {
     switch (pool) {
         case ZIP244_POOL_ORCHARD:
             return &ctx->actions_state;
         case ZIP244_POOL_IRONWOOD:
-            return ctx->tx_meta.is_v6 ? &ctx->ironwood_actions_state : NULL;
+            return &ctx->ironwood_actions_state;
         default:
             return NULL;
     }
@@ -614,7 +615,7 @@ OrchardSignerError orchard_signer_get_fee(OrchardSignerCtx *ctx,
     /* v6: both shielded pools contribute their net value balance to the
      * transaction's transparent value pool. Guard the sum against
      * companion-crafted wraparound before folding into the fee. */
-    if (ctx->tx_meta.is_v6) {
+    {
         int64_t ivb = ctx->tx_meta.ironwood_value_balance;
         if (ivb > 0 && vb > INT64_MAX - ivb) {
             orchard_signer_reset(ctx);
@@ -728,17 +729,12 @@ OrchardSignerError orchard_signer_verify(OrchardSignerCtx *ctx,
         memzero(transparent_empty, sizeof(transparent_empty));
     }
 
-    /* Compute the full ZIP-244 sighash from metadata + actions. v6
-     * transactions use the five-leaf tree with the Ironwood pool digest;
-     * a pool with zero streamed actions contributes its empty-bundle
-     * constant. */
+    /* Compute the full ZIP-244 v6 sighash from metadata + actions: the
+     * five-leaf tree with the Ironwood pool digest; a pool with zero
+     * streamed actions contributes its empty-bundle constant. */
     uint8_t computed[32];
-    if (ctx->tx_meta.is_v6) {
-        zip244_shielded_sighash_v6(&ctx->tx_meta, &ctx->actions_state,
-                                   &ctx->ironwood_actions_state, computed);
-    } else {
-        zip244_shielded_sighash(&ctx->tx_meta, &ctx->actions_state, computed);
-    }
+    zip244_shielded_sighash_v6(&ctx->tx_meta, &ctx->actions_state,
+                               &ctx->ironwood_actions_state, computed);
 
     if (!ct_memequal(computed, expected_sighash, 32)) {
         memzero(computed, sizeof(computed));

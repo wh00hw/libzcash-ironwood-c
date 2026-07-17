@@ -1,8 +1,10 @@
 /**
  * ZIP-244 Transaction Sighash Computation.
  *
- * Implements the v5 shielded sighash for Zcash Orchard transactions
- * as specified in https://zips.z.cash/zip-0244
+ * Implements the v6 (NU6.3 / Ironwood) five-leaf shielded sighash for
+ * Zcash Orchard-protocol transactions as specified in
+ * https://zips.z.cash/zip-0244. v6-only: the legacy v5 four-leaf sighash
+ * entry point and the v5 TxMeta wire layout have been removed.
  */
 #include "zip244.h"
 #include "blake2b.h"
@@ -293,12 +295,12 @@ static int64_t read_i64_le(const uint8_t* buf) {
 }
 
 bool zip244_parse_tx_meta(const uint8_t* data, size_t len, Zip244TxMeta* out) {
-    if (len < ZIP244_TX_META_SIZE) return false;
-
-    /* The v6 layout inserts the 41-byte Ironwood bundle section after the
-     * Orchard anchor; the layouts are discriminated by wire size (the four
-     * valid sizes — 125/129 v5, 166/170 v6 — are pairwise distinct). */
-    bool v6 = (len == ZIP244_TX_META_V6_SIZE || len == ZIP244_TX_META_V6_EXT_SIZE);
+    /* v6-only: exactly 166 (core) or 170 (with coin_type extension) bytes.
+     * Everything else — notably the legacy 125/129-byte v5 layouts — is
+     * rejected outright; the signer surfaces this as SIGNER_ERR_BAD_META. */
+    if (len != ZIP244_TX_META_V6_SIZE && len != ZIP244_TX_META_V6_EXT_SIZE) {
+        return false;
+    }
 
     out->version              = read_u32_le(data + 0);
     out->version_group_id     = read_u32_le(data + 4);
@@ -308,27 +310,17 @@ bool zip244_parse_tx_meta(const uint8_t* data, size_t len, Zip244TxMeta* out) {
     out->orchard_flags        = data[20];
     out->value_balance        = read_i64_le(data + 21);
     memcpy(out->anchor, data + 29, 32);
-    out->is_v6 = v6;
+    out->is_v6 = true;
 
-    size_t off = 61;
-    if (v6) {
-        out->ironwood_flags         = data[61];
-        out->ironwood_value_balance = read_i64_le(data + 62);
-        memcpy(out->ironwood_anchor, data + 70, 32);
-        off = 102;
-    } else {
-        out->ironwood_flags = 0;
-        out->ironwood_value_balance = 0;
-        memset(out->ironwood_anchor, 0, 32);
-    }
-    memcpy(out->transparent_sig_digest, data + off, 32);
-    memcpy(out->sapling_digest, data + off + 32, 32);
+    out->ironwood_flags         = data[61];
+    out->ironwood_value_balance = read_i64_le(data + 62);
+    memcpy(out->ironwood_anchor, data + 70, 32);
+    memcpy(out->transparent_sig_digest, data + 102, 32);
+    memcpy(out->sapling_digest, data + 134, 32);
 
     /* Extended format: coin_type appended after the core fields */
-    size_t core = v6 ? ZIP244_TX_META_V6_SIZE : ZIP244_TX_META_SIZE;
-    size_t ext  = v6 ? ZIP244_TX_META_V6_EXT_SIZE : ZIP244_TX_META_EXT_SIZE;
-    if (len >= ext) {
-        out->coin_type = read_u32_le(data + core);
+    if (len >= ZIP244_TX_META_V6_EXT_SIZE) {
+        out->coin_type = read_u32_le(data + ZIP244_TX_META_V6_SIZE);
     } else {
         out->coin_type = 0; /* unspecified (backward compat with old SDK) */
     }
@@ -336,6 +328,8 @@ bool zip244_parse_tx_meta(const uint8_t* data, size_t len, Zip244TxMeta* out) {
 }
 
 size_t zip244_encode_tx_meta(uint8_t* buf, const Zip244TxMeta* meta) {
+    /* v6-only: always emits the extended v6 layout (meta->is_v6 is
+     * ignored — this library has no pre-v6 wire format). */
     write_u32_le(buf + 0,  meta->version);
     write_u32_le(buf + 4,  meta->version_group_id);
     write_u32_le(buf + 8,  meta->consensus_branch_id);
@@ -344,18 +338,14 @@ size_t zip244_encode_tx_meta(uint8_t* buf, const Zip244TxMeta* meta) {
     buf[20] = meta->orchard_flags;
     write_i64_le(buf + 21, meta->value_balance);
     memcpy(buf + 29, meta->anchor, 32);
-    size_t off = 61;
-    if (meta->is_v6) {
-        buf[61] = meta->ironwood_flags;
-        write_i64_le(buf + 62, meta->ironwood_value_balance);
-        memcpy(buf + 70, meta->ironwood_anchor, 32);
-        off = 102;
-    }
-    memcpy(buf + off, meta->transparent_sig_digest, 32);
-    memcpy(buf + off + 32, meta->sapling_digest, 32);
+    buf[61] = meta->ironwood_flags;
+    write_i64_le(buf + 62, meta->ironwood_value_balance);
+    memcpy(buf + 70, meta->ironwood_anchor, 32);
+    memcpy(buf + 102, meta->transparent_sig_digest, 32);
+    memcpy(buf + 134, meta->sapling_digest, 32);
     /* Extended: coin_type (not part of ZIP-244 sighash, used for network validation) */
-    write_u32_le(buf + off + 64, meta->coin_type);
-    return meta->is_v6 ? ZIP244_TX_META_V6_EXT_SIZE : ZIP244_TX_META_EXT_SIZE;
+    write_u32_le(buf + ZIP244_TX_META_V6_SIZE, meta->coin_type);
+    return ZIP244_TX_META_V6_EXT_SIZE;
 }
 
 /* ------------------------------------------------------------------ */
@@ -381,10 +371,6 @@ void zip244_actions_init_pool(Zip244ActionsState* state, Zip244Pool pool, bool v
     state->v6 = v6;
     state->actions_hashed = 0;
     state->initialized = true;
-}
-
-void zip244_actions_init(Zip244ActionsState* state) {
-    zip244_actions_init_pool(state, ZIP244_POOL_ORCHARD, false);
 }
 
 bool zip244_hash_action(Zip244ActionsState* state,
@@ -469,13 +455,6 @@ void zip244_bundle_digest(Zip244ActionsState* state,
     blake2b_Final(&bundle, digest_out, 32);
 }
 
-void zip244_orchard_digest(Zip244ActionsState* state,
-                           const Zip244TxMeta* meta,
-                           uint8_t digest_out[32]) {
-    zip244_bundle_digest(state, meta->orchard_flags, meta->value_balance,
-                         meta->anchor, digest_out);
-}
-
 void zip244_pool_empty_digest(Zip244Pool pool, bool v6, uint8_t digest_out[32]) {
     zip244_empty_digest(bundle_personal(pool, v6), digest_out);
 }
@@ -514,42 +493,8 @@ void zip244_header_digest(const Zip244TxMeta* meta, uint8_t digest_out[32]) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Full shielded sighash                                             */
+/*  Full shielded sighash (v6 five-leaf tree)                         */
 /* ------------------------------------------------------------------ */
-
-void zip244_shielded_sighash(const Zip244TxMeta* meta,
-                             Zip244ActionsState* actions_state,
-                             uint8_t sighash_out[32]) {
-    /* 1. Header digest */
-    uint8_t hdr_digest[32];
-    zip244_header_digest(meta, hdr_digest);
-
-    /* 2. Transparent sig digest (pre-computed by companion) */
-    const uint8_t *transparent_digest = meta->transparent_sig_digest;
-
-    /* 3. Sapling digest (pre-computed by companion) */
-    const uint8_t *sapling_digest = meta->sapling_digest;
-
-    /* 4. Orchard digest */
-    uint8_t orchard_digest_val[32];
-    zip244_orchard_digest(actions_state, meta, orchard_digest_val);
-
-    /* 5. Root sighash:
-     * BLAKE2b-256("ZcashTxHash_" || consensus_branch_id[4 LE],
-     *     header || transparent || sapling || orchard)
-     */
-    uint8_t root_personal[16];
-    memcpy(root_personal, "ZcashTxHash_", 12);
-    write_u32_le(root_personal + 12, meta->consensus_branch_id);
-
-    blake2b_state root;
-    blake2b_InitPersonal(&root, 32, (const char*)root_personal, 16);
-    blake2b_Update(&root, hdr_digest, 32);
-    blake2b_Update(&root, transparent_digest, 32);
-    blake2b_Update(&root, sapling_digest, 32);
-    blake2b_Update(&root, orchard_digest_val, 32);
-    blake2b_Final(&root, sighash_out, 32);
-}
 
 void zip244_shielded_sighash_v6(const Zip244TxMeta* meta,
                                 Zip244ActionsState* orchard_state,

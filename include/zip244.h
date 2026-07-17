@@ -1,16 +1,15 @@
 /**
- * ZIP-244 Transaction Sighash Computation for Zcash v5 and v6 Transactions.
+ * ZIP-244 Transaction Sighash Computation for Zcash v6 Transactions.
  *
  * Implements the shielded sighash algorithm as specified in ZIP-244:
  * https://zips.z.cash/zip-0244
  *
- * v5 digest tree:
- *   sighash = BLAKE2b-256("ZcashTxHash_" || branch_id_le,
- *       header_digest || transparent_digest || sapling_digest || orchard_digest)
- *
- * Where orchard_digest = BLAKE2b-256("ZTxIdOrchardHash",
- *       compact_digest || memos_digest || noncompact_digest ||
- *       flags[1] || value_balance[8 LE] || anchor[32])
+ * v6-only (post-NU6.3): the legacy v5 four-leaf sighash entry point and the
+ * 125/129-byte v5 TxMeta wire layout have been removed — the parser rejects
+ * pre-v6 metadata outright. The pool/format-parameterized helpers
+ * (zip244_actions_init_pool, zip244_bundle_digest, zip244_pool_empty_digest)
+ * retain their v5-capable parameterization because the v6 digest tree
+ * domain-separates at the bundle level, but no top-level v5 path remains.
  *
  * v6 digest tree (NU6.3 / Ironwood, ZIP 258): adds the Ironwood pool leaf
  * and moves the shielded-pool anchors out of the effects digest (they are
@@ -50,30 +49,27 @@ typedef enum {
  * Transaction header metadata needed for sighash computation.
  * Sent from companion to device before action data.
  *
- * Wire format (125 bytes):
+ * Wire format (v6, 166 bytes — the ONLY layout this library accepts;
+ * legacy 125/129-byte v5 metas are rejected by zip244_parse_tx_meta):
  *   version[4 LE] || version_group_id[4 LE] || consensus_branch_id[4 LE] ||
  *   lock_time[4 LE] || expiry_height[4 LE] ||
  *   orchard_flags[1] || value_balance[8 LE signed] || anchor[32] ||
+ *   ironwood_flags[1] || ironwood_value_balance[8 LE signed] ||
+ *   ironwood_anchor[32] ||
  *   transparent_sig_digest[32] || sapling_digest[32]
  *
  * The transparent_sig_digest and sapling_digest are pre-computed by the
  * companion from the full transaction data, since the device only has
- * access to the Orchard bundle.
+ * access to the Orchard-protocol bundles.
  *
  * Orchard-only invariant: this signer enforces sapling_digest equal to
  * the ZIP-244 empty-bundle constant (zip244_sapling_empty_digest) at
  * orchard_signer_feed_meta() time. Any non-empty value aborts the
  * session with SIGNER_ERR_SAPLING_NOT_EMPTY before action streaming.
  */
-/** Wire size of the core v5 TxMeta fields (used for ZIP-244 sighash computation). */
-#define ZIP244_TX_META_SIZE     125
-/** Wire size with the coin_type extension (network discrimination). */
-#define ZIP244_TX_META_EXT_SIZE 129
-/** Wire size of the core v6 TxMeta fields (adds the Ironwood bundle section:
- *  ironwood_flags[1] || ironwood_value_balance[8] || ironwood_anchor[32]
- *  inserted after the Orchard anchor). */
+/** Wire size of the core v6 TxMeta fields. */
 #define ZIP244_TX_META_V6_SIZE     166
-/** v6 wire size with the coin_type extension. */
+/** v6 wire size with the coin_type extension (network discrimination). */
 #define ZIP244_TX_META_V6_EXT_SIZE 170
 
 /** NU6.3 consensus constants (v6 transaction format). */
@@ -89,8 +85,9 @@ typedef struct {
     uint8_t  orchard_flags;
     int64_t  value_balance;
     uint8_t  anchor[32];
-    /** True when the metadata was received in the v6 (170/166-byte) layout;
-     *  the Ironwood fields below are only meaningful in that case. */
+    /** Always true after a successful zip244_parse_tx_meta() — the library
+     *  is v6-only and the parser rejects pre-v6 layouts. Retained for
+     *  struct/firmware compatibility. */
     bool     is_v6;
     /** Ironwood bundle flag byte (bit 2 = enableCrossAddress under NU6.3). */
     uint8_t  ironwood_flags;
@@ -239,23 +236,20 @@ void zip244_transparent_per_input_sighash(
 
 /**
  * Parse transaction metadata from wire format.
+ *
+ * v6-only: accepts exactly ZIP244_TX_META_V6_SIZE (166) or
+ * ZIP244_TX_META_V6_EXT_SIZE (170) bytes; any other length — including the
+ * legacy 125/129-byte v5 layouts — returns false.
  * Returns true on success.
  */
 bool zip244_parse_tx_meta(const uint8_t* data, size_t len, Zip244TxMeta* out);
 
 /**
- * Serialize transaction metadata to wire format.
- * buf must be at least ZIP244_TX_META_SIZE bytes.
- * Returns ZIP244_TX_META_SIZE.
+ * Serialize transaction metadata to the v6 wire format (with the coin_type
+ * extension). buf must be at least ZIP244_TX_META_V6_EXT_SIZE bytes.
+ * Returns ZIP244_TX_META_V6_EXT_SIZE.
  */
 size_t zip244_encode_tx_meta(uint8_t* buf, const Zip244TxMeta* meta);
-
-/**
- * Initialize the incremental actions digest state for the legacy v5
- * Orchard bundle format. Must be called before any zip244_hash_action()
- * calls. Equivalent to zip244_actions_init_pool(state, ZIP244_POOL_ORCHARD, false).
- */
-void zip244_actions_init(Zip244ActionsState* state);
 
 /**
  * Initialize the incremental actions digest state for a specific pool and
@@ -279,19 +273,6 @@ void zip244_actions_init_pool(Zip244ActionsState* state, Zip244Pool pool, bool v
  */
 bool zip244_hash_action(Zip244ActionsState* state,
                         const uint8_t* action_data, size_t action_data_len);
-
-/**
- * Finalize the three action digesters and compute the full orchard digest.
- *
- * orchard_digest = BLAKE2b-256("ZTxIdOrchardHash",
- *     compact_digest || memos_digest || noncompact_digest ||
- *     flags[1] || value_balance[8 LE] || anchor[32])
- *
- * digest_out must be 32 bytes.
- */
-void zip244_orchard_digest(Zip244ActionsState* state,
-                           const Zip244TxMeta* meta,
-                           uint8_t digest_out[32]);
 
 /**
  * Finalize the three action digesters and compute the bundle effects digest
@@ -352,21 +333,6 @@ void zip244_sapling_empty_digest(uint8_t digest_out[32]);
  *     consensus_branch_id[4 LE] || lock_time[4 LE] || expiry_height[4 LE])
  */
 void zip244_header_digest(const Zip244TxMeta* meta, uint8_t digest_out[32]);
-
-/**
- * Compute the full v5 shielded sighash.
- *
- * sighash = BLAKE2b-256("ZcashTxHash_" || consensus_branch_id[4 LE],
- *     header_digest || transparent_digest || sapling_digest || orchard_digest)
- *
- * For Orchard-only transactions (no transparent, no sapling),
- * transparent_digest and sapling_digest are computed as empty-bundle hashes.
- *
- * sighash_out must be 32 bytes.
- */
-void zip244_shielded_sighash(const Zip244TxMeta* meta,
-                             Zip244ActionsState* actions_state,
-                             uint8_t sighash_out[32]);
 
 /**
  * Compute the full v6 (NU6.3 / Ironwood) shielded sighash.

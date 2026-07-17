@@ -341,44 +341,44 @@ static HWP_NOINLINE bool handle_tx_output(HwpDispatcher* d, HwpFrame* f) {
             return false;
         }
     } else {
-        /* Action data 0..N-1. Discriminate v4 vs v5 by payload size:
-         *   v4 (903 B)  = action(820) + recipient(43) + value(8) + rseed(32)
-         *   v5 (1415 B) = v4 + memo(512)
-         * The v5 path additionally verifies enc_ciphertext + epk on-device,
-         * closing the memo-substitution attack that v4 cmx-only leaves open.
-         *
-         * v6 (NU6.3 / Ironwood) sessions — recognized by the v6 TxMeta
-         * layout received at feed_meta — prefix every action payload with
-         * a 1-byte pool tag (0x00 = sealed Orchard, 0x01 = Ironwood).
-         * Strip and validate it, then reuse the v4/v5 size discrimination
-         * on the remainder; the tag routes the action into the matching
-         * ZIP-244 pool digest tree. */
+        /* Action data 0..N-1. v6-only intake (post-NU6.3): every action
+         * payload MUST carry a 1-byte pool tag (0x00 = sealed Orchard,
+         * 0x01 = Ironwood) followed by either the memo-verifying body
+         * (1415 B, on-wire 1416) or the compact cmx-only body (903 B,
+         * on-wire 904). Legacy untagged v4/v5 payloads (903/1415 B) hit
+         * the size gate below and are rejected. The memo-verifying path
+         * additionally verifies enc_ciphertext + epk on-device, closing
+         * the memo-substitution attack that cmx-only leaves open; the
+         * tag routes the action into the matching ZIP-244 pool digest
+         * tree. */
         phase(d, HWP_PHASE_VERIFY,
               (uint16_t)(txo.output_index + 1), txo.total_outputs);
         if(d->ui.progress) {
             d->ui.progress(0, "Verifying output...", d->user_ctx);
         }
 
-        const uint8_t* adata = txo.output_data;
-        size_t alen = txo.output_data_len;
-        Zip244Pool pool = ZIP244_POOL_ORCHARD;
-        if(d->signer->tx_meta.is_v6) {
-            if(alen < HWP_POOL_TAG_SIZE || adata[0] > ZIP244_POOL_IRONWOOD) {
-                send_error(d, f->seq, HWP_ERR_BAD_FRAME,
-                           "Bad v6 action pool tag");
-                orchard_signer_reset(d->signer);
-                return false;
-            }
-            pool = (Zip244Pool)adata[0];
-            adata += HWP_POOL_TAG_SIZE;
-            alen -= HWP_POOL_TAG_SIZE;
+        if(txo.output_data_len != HWP_ACTION_DATA_SIZE_V6 &&
+           txo.output_data_len != HWP_ACTION_DATA_SIZE_V6_COMPACT) {
+            send_error(d, f->seq, HWP_ERR_BAD_FRAME,
+                       "Action payload must be v6 pool-tagged (904/1416 B)");
+            orchard_signer_reset(d->signer);
+            return false;
         }
+        if(txo.output_data[0] > ZIP244_POOL_IRONWOOD) {
+            send_error(d, f->seq, HWP_ERR_BAD_FRAME,
+                       "Bad v6 action pool tag");
+            orchard_signer_reset(d->signer);
+            return false;
+        }
+        Zip244Pool pool = (Zip244Pool)txo.output_data[0];
+        const uint8_t* adata = txo.output_data + HWP_POOL_TAG_SIZE;
+        size_t alen = (size_t)txo.output_data_len - HWP_POOL_TAG_SIZE;
 
-        if(alen == HWP_ACTION_DATA_SIZE_V5) {
+        if(alen == HWP_ACTION_BODY_MEMO_SIZE) {
             HwpActionV5 av5;
-            if(!hwp_parse_action_v5(adata, alen, &av5)) {
+            if(!hwp_parse_action_v5(adata, (uint16_t)alen, &av5)) {
                 send_error(d, f->seq, HWP_ERR_BAD_FRAME,
-                           "Action v5 payload size mismatch");
+                           "Action memo-body size mismatch");
                 orchard_signer_reset(d->signer);
                 return false;
             }
@@ -412,9 +412,10 @@ static HWP_NOINLINE bool handle_tx_output(HwpDispatcher* d, HwpFrame* f) {
                 return false;
             }
         } else {
-            /* Backward-compat v4 path. */
+            /* Compact (cmx-only) body — used when the host has no memo
+             * plaintext to bind (e.g. OVK-None outputs). */
             HwpActionV4 av4;
-            if(!hwp_parse_action_v4(adata, alen, &av4)) {
+            if(!hwp_parse_action_v4(adata, (uint16_t)alen, &av4)) {
                 send_error(d, f->seq, HWP_ERR_BAD_FRAME,
                            "Action payload size mismatch");
                 orchard_signer_reset(d->signer);

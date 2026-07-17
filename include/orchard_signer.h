@@ -68,7 +68,10 @@ typedef enum {
 
 typedef enum {
     SIGNER_OK = 0,
-    SIGNER_ERR_BAD_META,          /* Invalid metadata payload */
+    SIGNER_ERR_BAD_META,          /* Invalid metadata payload — including
+                                     legacy pre-v6 TxMeta layouts (125/129
+                                     bytes): the library is v6-only and
+                                     rejects them outright */
     SIGNER_ERR_BAD_ACTION,        /* Invalid action data */
     SIGNER_ERR_BAD_STATE,         /* Unexpected call for current state */
     SIGNER_ERR_SIGHASH_MISMATCH,  /* Device-computed sighash != companion sighash */
@@ -143,10 +146,9 @@ typedef enum {
                                             decode to a valid Pallas point
                                             (x^3 + 5 is a non-square mod p).
                                             Structurally invalid input. */
-    SIGNER_ERR_BAD_POOL,                 /* action pool tag invalid for this
-                                            session: Ironwood action in a v5
-                                            transaction, or an unknown pool
-                                            byte on a v6 action payload. */
+    SIGNER_ERR_BAD_POOL,                 /* unknown pool byte on an action
+                                            payload (only 0x00 sealed Orchard
+                                            and 0x01 Ironwood are valid). */
 } OrchardSignerError;
 
 /**
@@ -230,10 +232,10 @@ typedef struct {
     OrchardSignerState state;
     Zip244TxMeta tx_meta;
     Zip244ActionsState actions_state;
-    /** Ironwood pool digest state (NU6.3, v6 transactions only). The legacy
-     *  `actions_state` hashes the (sealed) Orchard pool's actions; this one
-     *  hashes the Ironwood pool's. Wire actions are routed by their pool
-     *  tag. Unused (zero actions => empty-bundle leaf) for v5 sessions. */
+    /** Ironwood pool digest state (NU6.3). `actions_state` hashes the
+     *  (sealed) Orchard pool's actions; this one hashes the Ironwood
+     *  pool's. Wire actions are routed by their pool tag. A pool with
+     *  zero streamed actions contributes its empty-bundle leaf. */
     Zip244ActionsState ironwood_actions_state;
     Zip244TransparentState transparent_state;   /* v3: transparent digest */
     uint16_t actions_expected;
@@ -289,8 +291,15 @@ void orchard_signer_reset(OrchardSignerCtx *ctx);
  * Feed transaction metadata (called with HWP_TX_META_INDEX sentinel).
  * Transitions: IDLE → RECEIVING_ACTIONS.
  *
- * @param meta_data   Raw metadata bytes (ZIP244_TX_META_SIZE)
- * @param meta_len    Length of meta_data
+ * v6-only (post-NU6.3): meta_len must be ZIP244_TX_META_V6_SIZE (166) or
+ * ZIP244_TX_META_V6_EXT_SIZE (170). Legacy 125/129-byte v5 metas — and any
+ * other length — return SIGNER_ERR_BAD_META. Also enforces the v6 header
+ * constants (tx_version 0x80000006, version_group_id 0xD884B698) and the
+ * pool flag policy (sealed-Orchard enableCrossAddress bit clear, no
+ * reserved bits) with the same error.
+ *
+ * @param meta_data   Raw metadata bytes (v6 TxMeta wire layout)
+ * @param meta_len    Length of meta_data (166 or 170)
  * @param total_actions  Number of actions to expect
  */
 OrchardSignerError orchard_signer_feed_meta(OrchardSignerCtx *ctx,
@@ -301,9 +310,9 @@ OrchardSignerError orchard_signer_feed_meta(OrchardSignerCtx *ctx,
  * Feed one action's data (820 bytes).
  * Must be called in order: index 0, 1, ..., N-1.
  *
- * @param pool         The shielded pool the action belongs to. Ironwood is
- *                     only accepted for v6 sessions (v6 TxMeta layout);
- *                     v5 sessions must pass ZIP244_POOL_ORCHARD.
+ * @param pool         The shielded pool the action belongs to
+ *                     (ZIP244_POOL_ORCHARD or ZIP244_POOL_IRONWOOD; any
+ *                     other value → SIGNER_ERR_BAD_POOL).
  * @param action_data  Raw action bytes (HWP_ACTION_DATA_SIZE)
  * @param action_len   Length of action_data
  */
@@ -440,8 +449,8 @@ OrchardSignerError orchard_signer_get_action_display(
 
 /**
  * Read out the 512-byte memo plaintext captured for the given action
- * index. Returned only when the action was fed via the v5 path
- * (feed_action_with_note_and_memo); the cmx-only v4 path captures no
+ * index. Returned only when the action was fed via the memo-verifying path
+ * (feed_action_with_note_and_memo); the cmx-only path captures no
  * memo and `*present_out` is set to false.
  *
  * The firmware uses this to render the memo on the trusted screen so

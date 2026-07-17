@@ -209,7 +209,7 @@ bool hwp_parse_tx_output(const uint8_t* payload, uint16_t len, HwpTxOutput* out)
 
 bool hwp_parse_action_v4(const uint8_t* output_data, uint16_t output_data_len,
                          HwpActionV4* out) {
-    if(output_data_len != HWP_ACTION_DATA_SIZE_V4) return false;
+    if(output_data_len != HWP_ACTION_BODY_COMPACT_SIZE) return false;
     /* Layout (903 bytes):
      *   action[0..820]            -- 820 bytes ZIP-244 action data
      *   recipient[820..863]       -- 43 bytes d[11] || pk_d[32]
@@ -232,7 +232,7 @@ bool hwp_parse_action_v4(const uint8_t* output_data, uint16_t output_data_len,
 
 bool hwp_parse_action_v5(const uint8_t* output_data, uint16_t output_data_len,
                          HwpActionV5* out) {
-    if(output_data_len != HWP_ACTION_DATA_SIZE_V5) return false;
+    if(output_data_len != HWP_ACTION_BODY_MEMO_SIZE) return false;
     /* Layout (1415 bytes):
      *   action[0..820]
      *   recipient[820..863]

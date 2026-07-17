@@ -1,7 +1,8 @@
 /**
  * Tests for orchard_signer state machine — Orchard-only invariants.
  *
- * Covers two enforcement points:
+ * All fixtures use the v6 (NU6.3 / Ironwood) TxMeta wire layout — the only
+ * layout the v6-only library accepts. Covers three enforcement points:
  *
  * 1. Sapling-digest empty-bundle enforcement: feed_meta must accept a TxMeta
  *    whose sapling_digest equals BLAKE2b-256("ZTxIdSaplingHash", []) and
@@ -12,6 +13,10 @@
  *    rseed), and reject with SIGNER_ERR_NOTE_COMMITMENT_MISMATCH any
  *    attempt to swap the recipient (the canonical "hostile companion shows
  *    Mario, sends to attacker" siphoning attack).
+ *
+ * 3. v6-only wire tier: legacy 125/129-byte v5 TxMetas, wrong v6 header
+ *    constants, and forbidden pool flag bits must all be rejected with
+ *    SIGNER_ERR_BAD_META before any action streaming can begin.
  */
 #include "orchard_signer.h"
 #include "orchard.h"
@@ -21,28 +26,34 @@
 #include <stdio.h>
 #include <string.h>
 
-/* Build a minimal-but-valid 125-byte TxMeta wire payload with the given
- * sapling_digest. Other fields are set to plausible Nu5-mainnet values.
- * The transparent_sig_digest is populated with the empty-bundle constant
- * BLAKE2b-256("ZTxIdTranspaHash", "") so verify() does not reject the
- * fixture as a hostile-companion "non-empty digest with skipped transparent
- * flow" attempt. Callers that exercise transparent flow patch this field. */
-static void build_tx_meta_wire(uint8_t buf[125], const uint8_t sapling_digest[32]) {
-    memset(buf, 0, 125);
-    /* version = 5, version_group_id = 0x26A7270A (Nu5), branch_id = 0xC2D6D0B4 (Nu5),
-     * lock_time = 0, expiry_height = 0 */
-    buf[0]  = 0x05;                                /* version LE */
-    buf[4]  = 0x0A; buf[5]  = 0x27; buf[6]  = 0xA7; buf[7]  = 0x26;  /* vgi */
-    buf[8]  = 0xB4; buf[9]  = 0xD0; buf[10] = 0xD6; buf[11] = 0xC2;  /* branch_id */
-    /* orchard_flags = 0x03 (spends + outputs enabled) */
+/* Build a minimal-but-valid 166-byte v6 (NU6.3 / Ironwood) TxMeta wire
+ * payload with the given sapling_digest. Other fields are set to plausible
+ * NU6.3-mainnet values (the v6 header constants are MANDATORY — feed_meta
+ * rejects anything else). The transparent_sig_digest is populated with the
+ * empty-bundle constant BLAKE2b-256("ZTxIdTranspaHash", "") so verify()
+ * does not reject the fixture as a hostile-companion "non-empty digest with
+ * skipped transparent flow" attempt. Callers that exercise transparent flow
+ * patch this field. */
+static void build_tx_meta_wire(uint8_t buf[ZIP244_TX_META_V6_SIZE],
+                               const uint8_t sapling_digest[32]) {
+    memset(buf, 0, ZIP244_TX_META_V6_SIZE);
+    /* version = 0x80000006, version_group_id = 0xD884B698,
+     * branch_id = 0x37A5165B (NU6.3), lock_time = 0, expiry_height = 0 */
+    buf[0]  = 0x06; buf[1]  = 0x00; buf[2]  = 0x00; buf[3]  = 0x80;  /* version */
+    buf[4]  = 0x98; buf[5]  = 0xB6; buf[6]  = 0x84; buf[7]  = 0xD8;  /* vgi */
+    buf[8]  = 0x5B; buf[9]  = 0x16; buf[10] = 0xA5; buf[11] = 0x37;  /* branch_id */
+    /* orchard_flags = 0x03 (spends + outputs; cross-address bit clear) */
     buf[20] = 0x03;
-    /* value_balance = 0, anchor = 32 zero bytes (offset 29..60) */
-    /* transparent_sig_digest at offset 61..92: empty-bundle constant */
+    /* value_balance = 0 (offset 21..28), anchor = 32 zero bytes (29..60) */
+    /* ironwood_flags = 0x03 (spends + outputs) at offset 61;
+     * ironwood_value_balance = 0 (62..69); ironwood_anchor = zero (70..101) */
+    buf[61] = 0x03;
+    /* transparent_sig_digest at offset 102..133: empty-bundle constant */
     uint8_t transparent_empty[32];
     zip244_empty_digest("ZTxIdTranspaHash", transparent_empty);
-    memcpy(buf + 61, transparent_empty, 32);
-    /* sapling_digest at offset 93 */
-    memcpy(buf + 93, sapling_digest, 32);
+    memcpy(buf + 102, transparent_empty, 32);
+    /* sapling_digest at offset 134 */
+    memcpy(buf + 134, sapling_digest, 32);
 }
 
 static void test_sapling_empty_accepted(void) {
@@ -52,7 +63,7 @@ static void test_sapling_empty_accepted(void) {
     uint8_t empty[32];
     zip244_sapling_empty_digest(empty);
 
-    uint8_t wire[125];
+    uint8_t wire[ZIP244_TX_META_V6_SIZE];
     build_tx_meta_wire(wire, empty);
 
     OrchardSignerError err = orchard_signer_feed_meta(&ctx, wire, sizeof(wire), 1);
@@ -71,7 +82,7 @@ static void test_sapling_nonempty_rejected(void) {
     uint8_t nonempty[32];
     memset(nonempty, 0xAA, 32);
 
-    uint8_t wire[125];
+    uint8_t wire[ZIP244_TX_META_V6_SIZE];
     build_tx_meta_wire(wire, nonempty);
 
     OrchardSignerError err = orchard_signer_feed_meta(&ctx, wire, sizeof(wire), 1);
@@ -91,7 +102,7 @@ static void test_sapling_off_by_one_byte_rejected(void) {
     zip244_sapling_empty_digest(tampered);
     tampered[17] ^= 0x01;
 
-    uint8_t wire[125];
+    uint8_t wire[ZIP244_TX_META_V6_SIZE];
     build_tx_meta_wire(wire, tampered);
 
     OrchardSignerError err = orchard_signer_feed_meta(&ctx, wire, sizeof(wire), 1);
@@ -121,6 +132,97 @@ static void test_sapling_empty_constant_is_stable(void) {
 }
 
 /* ----------------------------------------------------------------------- */
+/*  v6-only wire tier enforcement (post-NU6.3)                             */
+/* ----------------------------------------------------------------------- */
+
+static void test_v5_meta_rejected(void) {
+    /* Legacy 125-byte (core) and 129-byte (coin_type-extended) v5 TxMeta
+     * layouts must be rejected with SIGNER_ERR_BAD_META — the device no
+     * longer speaks the pre-NU6.3 wire tier. Build a well-formed v5 meta
+     * (valid NU5 header, empty-bundle digests) so the rejection is
+     * attributable to the layout, not to a broken field. */
+    uint8_t wire[129];
+    memset(wire, 0, sizeof(wire));
+    wire[0]  = 0x05;                                                 /* version = 5 */
+    wire[4]  = 0x0A; wire[5]  = 0x27; wire[6]  = 0xA7; wire[7]  = 0x26; /* NU5 vgi */
+    wire[8]  = 0xB4; wire[9]  = 0xD0; wire[10] = 0xD6; wire[11] = 0xC2; /* NU5 branch */
+    wire[20] = 0x03;                                                 /* orchard_flags */
+    uint8_t transparent_empty[32];
+    zip244_empty_digest("ZTxIdTranspaHash", transparent_empty);
+    memcpy(wire + 61, transparent_empty, 32);   /* v5 transparent offset */
+    zip244_sapling_empty_digest(wire + 93);     /* v5 sapling offset */
+
+    OrchardSignerCtx ctx;
+    orchard_signer_init(&ctx);
+    OrchardSignerError err = orchard_signer_feed_meta(&ctx, wire, 125, 1);
+    assert(err == SIGNER_ERR_BAD_META);
+    assert(ctx.state == SIGNER_IDLE);
+    assert(ctx.has_meta == false);
+
+    /* 129-byte extended variant (coin_type = 133 appended). */
+    wire[125] = 133;
+    orchard_signer_init(&ctx);
+    err = orchard_signer_feed_meta(&ctx, wire, 129, 1);
+    assert(err == SIGNER_ERR_BAD_META);
+    assert(ctx.state == SIGNER_IDLE);
+    assert(ctx.has_meta == false);
+    printf("  PASS: legacy v5 TxMeta (125 and 129 bytes) rejected (BAD_META)\n");
+}
+
+static void test_v6_meta_wrong_header_rejected(void) {
+    /* A v6-SIZED TxMeta whose header carries pre-v6 constants must be
+     * rejected: a companion could otherwise pick digest personalizations
+     * that don't match the encoded transaction. */
+    OrchardSignerCtx ctx;
+    uint8_t empty[32];
+    zip244_sapling_empty_digest(empty);
+    uint8_t wire[ZIP244_TX_META_V6_SIZE];
+
+    /* version = 5 instead of 0x80000006. */
+    build_tx_meta_wire(wire, empty);
+    wire[0] = 0x05; wire[3] = 0x00;
+    orchard_signer_init(&ctx);
+    assert(orchard_signer_feed_meta(&ctx, wire, sizeof(wire), 1)
+           == SIGNER_ERR_BAD_META);
+    assert(ctx.state == SIGNER_IDLE);
+
+    /* version_group_id = NU5's 0x26A7270A instead of 0xD884B698. */
+    build_tx_meta_wire(wire, empty);
+    wire[4] = 0x0A; wire[5] = 0x27; wire[6] = 0xA7; wire[7] = 0x26;
+    orchard_signer_init(&ctx);
+    assert(orchard_signer_feed_meta(&ctx, wire, sizeof(wire), 1)
+           == SIGNER_ERR_BAD_META);
+    assert(ctx.state == SIGNER_IDLE);
+    printf("  PASS: v6-sized TxMeta with pre-v6 header constants rejected\n");
+}
+
+static void test_v6_meta_bad_flags_rejected(void) {
+    /* Sealed-Orchard flag policy: bit 2 (enableCrossAddress) must be clear
+     * post-NU6.3, and neither pool may set reserved bits. */
+    OrchardSignerCtx ctx;
+    uint8_t empty[32];
+    zip244_sapling_empty_digest(empty);
+    uint8_t wire[ZIP244_TX_META_V6_SIZE];
+
+    /* orchard_flags = 0x07: cross-address bit set on the sealed pool. */
+    build_tx_meta_wire(wire, empty);
+    wire[20] = 0x07;
+    orchard_signer_init(&ctx);
+    assert(orchard_signer_feed_meta(&ctx, wire, sizeof(wire), 1)
+           == SIGNER_ERR_BAD_META);
+    assert(ctx.state == SIGNER_IDLE);
+
+    /* ironwood_flags = 0x0F: reserved bit set. */
+    build_tx_meta_wire(wire, empty);
+    wire[61] = 0x0F;
+    orchard_signer_init(&ctx);
+    assert(orchard_signer_feed_meta(&ctx, wire, sizeof(wire), 1)
+           == SIGNER_ERR_BAD_META);
+    assert(ctx.state == SIGNER_IDLE);
+    printf("  PASS: forbidden pool flag bits rejected (BAD_META)\n");
+}
+
+/* ----------------------------------------------------------------------- */
 /*  NoteCommitment (cmx) verification                                      */
 /* ----------------------------------------------------------------------- */
 
@@ -137,19 +239,19 @@ static void build_synthetic_action(uint8_t out[820],
 }
 
 /* Feed a valid TxMeta + start session (returns ctx in RECEIVING_ACTIONS). */
-static void start_session_for_one_action(OrchardSignerCtx *ctx, uint8_t wire[125]) {
+static void start_session_for_one_action(OrchardSignerCtx *ctx, uint8_t wire[ZIP244_TX_META_V6_SIZE]) {
     orchard_signer_init(ctx);
     uint8_t empty[32];
     zip244_sapling_empty_digest(empty);
     build_tx_meta_wire(wire, empty);
-    OrchardSignerError err = orchard_signer_feed_meta(ctx, wire, 125, 1);
+    OrchardSignerError err = orchard_signer_feed_meta(ctx, wire, ZIP244_TX_META_V6_SIZE, 1);
     assert(err == SIGNER_OK);
     assert(ctx->state == SIGNER_RECEIVING_ACTIONS);
 }
 
 static void test_note_commit_match_accepted(void) {
     OrchardSignerCtx ctx;
-    uint8_t wire[125];
+    uint8_t wire[ZIP244_TX_META_V6_SIZE];
     start_session_for_one_action(&ctx, wire);
 
     uint8_t action[820];
@@ -169,7 +271,7 @@ static void test_note_commit_attacker_recipient_rejected(void) {
      * different recipient as the claimed one (the attacker). The check
      * must catch it. */
     OrchardSignerCtx ctx;
-    uint8_t wire[125];
+    uint8_t wire[ZIP244_TX_META_V6_SIZE];
     start_session_for_one_action(&ctx, wire);
 
     uint8_t action[820];
@@ -195,7 +297,7 @@ static void test_note_commit_attacker_value_rejected(void) {
     /* Same attack on the value: companion shows "0.5 ZEC to Mario" but
      * the action commits to a different value. */
     OrchardSignerCtx ctx;
-    uint8_t wire[125];
+    uint8_t wire[ZIP244_TX_META_V6_SIZE];
     start_session_for_one_action(&ctx, wire);
 
     uint8_t action[820];
@@ -211,7 +313,7 @@ static void test_note_commit_attacker_value_rejected(void) {
 
 static void test_note_commit_wrong_action_size_rejected(void) {
     OrchardSignerCtx ctx;
-    uint8_t wire[125];
+    uint8_t wire[ZIP244_TX_META_V6_SIZE];
     start_session_for_one_action(&ctx, wire);
 
     uint8_t action[820];
@@ -277,7 +379,7 @@ static const uint8_t test_memo[512] = {
 
 static void test_memo_full_consistency_accepted(void) {
     OrchardSignerCtx ctx;
-    uint8_t wire[125];
+    uint8_t wire[ZIP244_TX_META_V6_SIZE];
     start_session_for_one_action(&ctx, wire);
 
     uint8_t action[820];
@@ -302,7 +404,7 @@ static void test_memo_captured_for_display(void) {
      * binding catches "memo on chain != memo declared" but the user
      * cannot detect "memo declared != memo shown by companion UI". */
     OrchardSignerCtx ctx;
-    uint8_t wire[125];
+    uint8_t wire[ZIP244_TX_META_V6_SIZE];
     start_session_for_one_action(&ctx, wire);
 
     uint8_t action[820];
@@ -333,7 +435,7 @@ static void test_memo_not_present_for_v4_feed(void) {
      * present=false. Lets the firmware skip the memo-review step
      * gracefully on legacy / OVK-None payloads. */
     OrchardSignerCtx ctx;
-    uint8_t wire[125];
+    uint8_t wire[ZIP244_TX_META_V6_SIZE];
     start_session_for_one_action(&ctx, wire);
 
     uint8_t action[820];
@@ -355,7 +457,7 @@ static void test_memo_tampered_memo_rejected(void) {
      * action with the real memo, then telling feed() that the memo
      * was something else. */
     OrchardSignerCtx ctx;
-    uint8_t wire[125];
+    uint8_t wire[ZIP244_TX_META_V6_SIZE];
     start_session_for_one_action(&ctx, wire);
 
     uint8_t action[820];
@@ -383,7 +485,7 @@ static void test_memo_tampered_rseed_rejected(void) {
      * encryption. cmx mismatch fires first; the test checks rseed
      * tamper detection regardless of which leg catches it. */
     OrchardSignerCtx ctx;
-    uint8_t wire[125];
+    uint8_t wire[ZIP244_TX_META_V6_SIZE];
     start_session_for_one_action(&ctx, wire);
 
     uint8_t action[820];
@@ -415,7 +517,7 @@ static void test_memo_tampered_enc_ciphertext_rejected(void) {
      * "I tell you what the memo says but write something else on chain"
      * attack — the device must catch the divergence and abort. */
     OrchardSignerCtx ctx;
-    uint8_t wire[125];
+    uint8_t wire[ZIP244_TX_META_V6_SIZE];
     start_session_for_one_action(&ctx, wire);
 
     uint8_t action[820];
@@ -450,15 +552,17 @@ static void test_memo_tampered_enc_ciphertext_rejected(void) {
  */
 
 static void compute_sighash(OrchardSignerCtx *src, uint8_t out[32]) {
-    /* Snapshot the actions_state so the streaming hashers don't get
-     * finalized in `src` itself. zip244_shielded_sighash() finalizes them. */
-    Zip244ActionsState snap = src->actions_state;
-    zip244_shielded_sighash(&src->tx_meta, &snap, out);
+    /* Snapshot both pool states so the streaming hashers don't get
+     * finalized in `src` itself. zip244_shielded_sighash_v6() finalizes
+     * the non-empty ones. */
+    Zip244ActionsState orchard_snap  = src->actions_state;
+    Zip244ActionsState ironwood_snap = src->ironwood_actions_state;
+    zip244_shielded_sighash_v6(&src->tx_meta, &orchard_snap, &ironwood_snap, out);
 }
 
 static void test_verify_refuses_without_any_confirm(void) {
     OrchardSignerCtx ctx;
-    uint8_t wire[125];
+    uint8_t wire[ZIP244_TX_META_V6_SIZE];
     start_session_for_one_action(&ctx, wire);
 
     uint8_t action[820];
@@ -481,7 +585,7 @@ static void test_verify_refuses_without_any_confirm(void) {
 
 static void test_verify_accepts_after_confirm(void) {
     OrchardSignerCtx ctx;
-    uint8_t wire[125];
+    uint8_t wire[ZIP244_TX_META_V6_SIZE];
     start_session_for_one_action(&ctx, wire);
 
     uint8_t action[820];
@@ -519,7 +623,7 @@ static void test_verify_refuses_without_fee_confirm(void) {
     /* All actions confirmed but fee not → verify must refuse with the
      * no-blind-signing-for-fee invariant. */
     OrchardSignerCtx ctx;
-    uint8_t wire[125];
+    uint8_t wire[ZIP244_TX_META_V6_SIZE];
     start_session_for_one_action(&ctx, wire);
 
     uint8_t action[820];
@@ -544,7 +648,7 @@ static void test_confirm_fee_refuses_without_get_fee(void) {
     /* confirm_fee() before get_fee() must refuse: a firmware UI that
      * "confirms" before computing would be approving a stale zero. */
     OrchardSignerCtx ctx;
-    uint8_t wire[125];
+    uint8_t wire[ZIP244_TX_META_V6_SIZE];
     start_session_for_one_action(&ctx, wire);
 
     OrchardSignerError err = orchard_signer_confirm_fee(&ctx);
@@ -561,12 +665,12 @@ static void test_get_fee_orchard_only_returns_value_balance(void) {
 
     uint8_t empty[32];
     zip244_sapling_empty_digest(empty);
-    uint8_t wire[125];
+    uint8_t wire[ZIP244_TX_META_V6_SIZE];
     build_tx_meta_wire(wire, empty);
     /* value_balance is at offset 21 (i64 LE). 10_000 = 0x2710. */
     wire[21] = 0x10; wire[22] = 0x27;
 
-    assert(orchard_signer_feed_meta(&ctx, wire, 125, 1) == SIGNER_OK);
+    assert(orchard_signer_feed_meta(&ctx, wire, ZIP244_TX_META_V6_SIZE, 1) == SIGNER_OK);
 
     uint64_t fee = 0xDEADBEEF;
     assert(orchard_signer_get_fee(&ctx, &fee) == SIGNER_OK);
@@ -586,13 +690,13 @@ static void test_get_fee_rejects_negative(void) {
 
     uint8_t empty[32];
     zip244_sapling_empty_digest(empty);
-    uint8_t wire[125];
+    uint8_t wire[ZIP244_TX_META_V6_SIZE];
     build_tx_meta_wire(wire, empty);
     /* value_balance = -1000 (two's complement i64 LE). */
     int64_t vb = -1000;
     for (int i = 0; i < 8; i++) wire[21 + i] = (uint8_t)((uint64_t)vb >> (8 * i));
 
-    assert(orchard_signer_feed_meta(&ctx, wire, 125, 1) == SIGNER_OK);
+    assert(orchard_signer_feed_meta(&ctx, wire, ZIP244_TX_META_V6_SIZE, 1) == SIGNER_OK);
 
     uint64_t fee = 0;
     OrchardSignerError err = orchard_signer_get_fee(&ctx, &fee);
@@ -609,9 +713,9 @@ static void test_verify_refuses_partial_confirm(void) {
 
     uint8_t empty[32];
     zip244_sapling_empty_digest(empty);
-    uint8_t wire[125];
+    uint8_t wire[ZIP244_TX_META_V6_SIZE];
     build_tx_meta_wire(wire, empty);
-    assert(orchard_signer_feed_meta(&ctx, wire, 125, 3) == SIGNER_OK);
+    assert(orchard_signer_feed_meta(&ctx, wire, ZIP244_TX_META_V6_SIZE, 3) == SIGNER_OK);
 
     uint8_t action[820];
     for (int i = 0; i < 3; i++) {
@@ -635,7 +739,7 @@ static void test_verify_refuses_partial_confirm(void) {
 
 static void test_invalid_action_index(void) {
     OrchardSignerCtx ctx;
-    uint8_t wire[125];
+    uint8_t wire[ZIP244_TX_META_V6_SIZE];
     start_session_for_one_action(&ctx, wire);
 
     /* No action fed yet — index 0 is invalid. */
@@ -665,11 +769,11 @@ static void test_too_many_actions_rejected_at_meta(void) {
 
     uint8_t empty[32];
     zip244_sapling_empty_digest(empty);
-    uint8_t wire[125];
+    uint8_t wire[ZIP244_TX_META_V6_SIZE];
     build_tx_meta_wire(wire, empty);
 
     OrchardSignerError err = orchard_signer_feed_meta(
-        &ctx, wire, 125, ORCHARD_SIGNER_MAX_ACTIONS + 1);
+        &ctx, wire, ZIP244_TX_META_V6_SIZE, ORCHARD_SIGNER_MAX_ACTIONS + 1);
     assert(err == SIGNER_ERR_TOO_MANY_ACTIONS);
     /* Context must remain in IDLE — meta was rejected. */
     assert(ctx.state == SIGNER_IDLE);
@@ -682,7 +786,7 @@ static void test_sign_refuses_without_verify(void) {
      * but sign() also short-circuits to NOT_VERIFIED if a confused
      * caller skips verify(). */
     OrchardSignerCtx ctx;
-    uint8_t wire[125];
+    uint8_t wire[ZIP244_TX_META_V6_SIZE];
     start_session_for_one_action(&ctx, wire);
 
     uint8_t action[820];
@@ -734,7 +838,7 @@ static void test_transparent_output_capture_p2pkh(void) {
      * the user only the change Orchard receivers, not the actual
      * transparent recipient. */
     OrchardSignerCtx ctx;
-    uint8_t wire[125];
+    uint8_t wire[ZIP244_TX_META_V6_SIZE];
     start_session_for_one_action(&ctx, wire);
     assert(orchard_signer_begin_transparent(&ctx, /*in*/0, /*out*/1) == SIGNER_OK);
     assert(ctx.state == SIGNER_RECEIVING_TRANSPARENT);
@@ -770,7 +874,7 @@ static void test_transparent_output_oversized_script_rejected(void) {
      * non-standard shape would have to be displayed as raw script
      * (which the no-blind-signing invariant refuses to do). */
     OrchardSignerCtx ctx;
-    uint8_t wire[125];
+    uint8_t wire[ZIP244_TX_META_V6_SIZE];
     start_session_for_one_action(&ctx, wire);
     assert(orchard_signer_begin_transparent(&ctx, 0, 1) == SIGNER_OK);
 
@@ -792,7 +896,7 @@ static void test_transparent_output_too_many_rejected(void) {
      * TOO_MANY_ACTIONS. The invariant is the same as for Orchard
      * actions: every output the device signs must be displayable. */
     OrchardSignerCtx ctx;
-    uint8_t wire[125];
+    uint8_t wire[ZIP244_TX_META_V6_SIZE];
     start_session_for_one_action(&ctx, wire);
     assert(orchard_signer_begin_transparent(
                &ctx, 0, ORCHARD_SIGNER_MAX_T_OUTPUTS + 1) == SIGNER_OK);
@@ -820,7 +924,7 @@ static void test_transparent_output_too_many_rejected(void) {
 
 static void test_transparent_get_display_out_of_range(void) {
     OrchardSignerCtx ctx;
-    uint8_t wire[125];
+    uint8_t wire[ZIP244_TX_META_V6_SIZE];
     start_session_for_one_action(&ctx, wire);
     assert(orchard_signer_begin_transparent(&ctx, 0, 1) == SIGNER_OK);
 
@@ -845,7 +949,7 @@ static void test_recipient_matches_any_after_feed(void) {
      * user-confirmed Orchard receiver, closing the post-confirmation
      * recipient-substitution attack. */
     OrchardSignerCtx ctx;
-    uint8_t wire[125];
+    uint8_t wire[ZIP244_TX_META_V6_SIZE];
     start_session_for_one_action(&ctx, wire);
 
     uint8_t action[820];
@@ -871,7 +975,7 @@ static void test_recipient_matches_any_empty(void) {
     /* With no actions received the matcher must return false rather
      * than e.g. degenerate-match against zero-initialised storage. */
     OrchardSignerCtx ctx;
-    uint8_t wire[125];
+    uint8_t wire[ZIP244_TX_META_V6_SIZE];
     start_session_for_one_action(&ctx, wire);
 
     uint8_t zeros[43] = {0};
@@ -885,6 +989,11 @@ int main(void) {
     test_sapling_nonempty_rejected();
     test_sapling_off_by_one_byte_rejected();
     test_sapling_empty_constant_is_stable();
+
+    printf("\nOrchard signer / v6-only wire tier enforcement tests:\n");
+    test_v5_meta_rejected();
+    test_v6_meta_wrong_header_rejected();
+    test_v6_meta_bad_flags_rejected();
 
     printf("\nOrchard signer / NoteCommitment (cmx) verification tests:\n");
     test_note_commit_match_accepted();

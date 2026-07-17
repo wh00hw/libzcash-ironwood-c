@@ -21,6 +21,7 @@
 
 #include "hwp.h"
 #include "orchard_signer.h"
+#include "zip244.h"
 
 /* ── Stub callback state ──────────────────────────────────────────── */
 
@@ -308,6 +309,123 @@ static void test_unknown_message_yields_error(void) {
     printf("  PASS: unknown message type → Error(HWP_ERR_UNKNOWN)\n");
 }
 
+/* ── v6-only wire tier enforcement (post-NU6.3) ───────────────────── */
+
+/* Build a well-formed 166-byte v6 TxMeta wire (v6 header constants,
+ * empty-bundle transparent + sapling digests, flags within policy) that
+ * orchard_signer_feed_meta() accepts. */
+static void build_v6_meta_wire(uint8_t buf[ZIP244_TX_META_V6_SIZE]) {
+    memset(buf, 0, ZIP244_TX_META_V6_SIZE);
+    buf[0]  = 0x06; buf[3]  = 0x80;                                  /* version */
+    buf[4]  = 0x98; buf[5]  = 0xB6; buf[6]  = 0x84; buf[7]  = 0xD8;  /* vgi */
+    buf[8]  = 0x5B; buf[9]  = 0x16; buf[10] = 0xA5; buf[11] = 0x37;  /* NU6.3 */
+    buf[20] = 0x03;                                                  /* orchard_flags */
+    buf[61] = 0x03;                                                  /* ironwood_flags */
+    zip244_empty_digest("ZTxIdTranspaHash", buf + 102);
+    zip244_sapling_empty_digest(buf + 134);
+}
+
+/* Wrap output_data in a TX_OUTPUT payload and enqueue the frame. */
+static void push_tx_output(Stub* s, uint8_t seq, uint16_t index, uint16_t total,
+                           const uint8_t* data, uint16_t data_len) {
+    static uint8_t payload[HWP_MAX_PAYLOAD];
+    uint16_t plen = hwp_encode_tx_output(payload, index, total, data, data_len);
+    push_frame(s, seq, HWP_MSG_TX_OUTPUT, payload, plen);
+}
+
+/* Scan the device's TX stream counting ACKs and BAD_FRAME errors. */
+static void count_ack_and_bad_frame(const Stub* s, int* acks, int* bad_frames) {
+    *acks = 0;
+    *bad_frames = 0;
+    size_t pos = 0;
+    HwpFrame f;
+    while(pop_frame(s, &pos, &f) == 0) {
+        if(f.type == HWP_MSG_TX_OUTPUT_ACK) (*acks)++;
+        if(f.type == HWP_MSG_ERROR && f.payload_len >= 1 &&
+           f.payload[0] == HWP_ERR_BAD_FRAME) (*bad_frames)++;
+    }
+}
+
+static void test_v5_meta_rejected_by_dispatcher(void) {
+    /* A legacy 125-byte v5 TxMeta must be answered with
+     * Error(HWP_ERR_BAD_FRAME) and no ACK; the signer stays IDLE. */
+    Stub s = {0};
+    s.exit_after = 40;
+    uint8_t v5_meta[125];
+    memset(v5_meta, 0, sizeof(v5_meta));
+    v5_meta[0] = 0x05;
+    push_tx_output(&s, /*seq=*/1, HWP_TX_META_INDEX, 1, v5_meta, sizeof(v5_meta));
+
+    OrchardSignerCtx signer;
+    orchard_signer_init(&signer);
+    HwpDispatcher d = build_dispatcher(&s, &signer);
+    assert(hwp_dispatcher_run(&d) == HWP_DISP_EXIT_REQUESTED);
+
+    int acks, bad_frames;
+    count_ack_and_bad_frame(&s, &acks, &bad_frames);
+    assert(bad_frames >= 1);
+    assert(acks == 0);
+    assert(signer.state == SIGNER_IDLE);
+    printf("  PASS: legacy v5 TxMeta (125 B) → Error(BAD_FRAME), no ACK\n");
+}
+
+static void test_untagged_action_rejected(uint16_t body_len, const char* label) {
+    /* A valid v6 session is opened (meta ACKed), then a legacy UNTAGGED
+     * action payload (903 or 1415 bytes — no pool tag) is fed. The
+     * dispatcher must reject it with Error(HWP_ERR_BAD_FRAME) and reset
+     * the signer. */
+    Stub s = {0};
+    s.exit_after = 80;
+    uint8_t meta[ZIP244_TX_META_V6_SIZE];
+    build_v6_meta_wire(meta);
+    push_tx_output(&s, /*seq=*/1, HWP_TX_META_INDEX, 1, meta, sizeof(meta));
+
+    static uint8_t action[HWP_ACTION_BODY_MEMO_SIZE]; /* max body size */
+    memset(action, 0, sizeof(action));
+    assert(body_len <= sizeof(action));
+    push_tx_output(&s, /*seq=*/2, 0, 1, action, body_len);
+
+    OrchardSignerCtx signer;
+    orchard_signer_init(&signer);
+    HwpDispatcher d = build_dispatcher(&s, &signer);
+    assert(hwp_dispatcher_run(&d) == HWP_DISP_EXIT_REQUESTED);
+
+    int acks, bad_frames;
+    count_ack_and_bad_frame(&s, &acks, &bad_frames);
+    assert(acks == 1);        /* the meta only */
+    assert(bad_frames >= 1);  /* the untagged action */
+    assert(signer.state == SIGNER_IDLE); /* session was reset */
+    printf("  PASS: untagged %s action rejected → Error(BAD_FRAME), signer reset\n",
+           label);
+}
+
+static void test_bad_pool_tag_rejected(void) {
+    /* A correctly-sized (904 B) action whose pool tag is neither 0x00 nor
+     * 0x01 must be rejected. */
+    Stub s = {0};
+    s.exit_after = 80;
+    uint8_t meta[ZIP244_TX_META_V6_SIZE];
+    build_v6_meta_wire(meta);
+    push_tx_output(&s, /*seq=*/1, HWP_TX_META_INDEX, 1, meta, sizeof(meta));
+
+    static uint8_t action[HWP_ACTION_DATA_SIZE_V6_COMPACT];
+    memset(action, 0, sizeof(action));
+    action[0] = 0x02; /* invalid pool tag */
+    push_tx_output(&s, /*seq=*/2, 0, 1, action, sizeof(action));
+
+    OrchardSignerCtx signer;
+    orchard_signer_init(&signer);
+    HwpDispatcher d = build_dispatcher(&s, &signer);
+    assert(hwp_dispatcher_run(&d) == HWP_DISP_EXIT_REQUESTED);
+
+    int acks, bad_frames;
+    count_ack_and_bad_frame(&s, &acks, &bad_frames);
+    assert(acks == 1);
+    assert(bad_frames >= 1);
+    assert(signer.state == SIGNER_IDLE);
+    printf("  PASS: pool tag 0x02 rejected → Error(BAD_FRAME), signer reset\n");
+}
+
 static void test_null_callbacks_rejected(void) {
     /* Mandatory callbacks (drain/send/tick/sleep/should_exit + the two
      * blocking UI prompts) cannot be NULL — calling hwp_dispatcher_run
@@ -343,6 +461,12 @@ int main(void) {
     test_fvk_req_wrong_network_rejected();
     test_unknown_message_yields_error();
     test_null_callbacks_rejected();
+
+    printf("\nHWP dispatcher v6-only wire tier tests:\n");
+    test_v5_meta_rejected_by_dispatcher();
+    test_untagged_action_rejected(HWP_ACTION_BODY_COMPACT_SIZE, "903 B (ex-v4)");
+    test_untagged_action_rejected(HWP_ACTION_BODY_MEMO_SIZE, "1415 B (ex-v5)");
+    test_bad_pool_tag_rejected();
     printf("All dispatcher tests passed.\n");
     return 0;
 }
