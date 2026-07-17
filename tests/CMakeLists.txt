@@ -8,7 +8,7 @@
 #     having to provide a platform RNG stub.
 #   - aes_ct.c (audit H-3): the constant-time AES, replacing the legacy
 #     Brian-Gladman files that were removed from the build.
-add_library(zcash-orchard-c-deterministic STATIC
+add_library(zcash-ironwood-c-deterministic STATIC
     ${CMAKE_SOURCE_DIR}/src/orchard.c
     ${CMAKE_SOURCE_DIR}/src/pallas.c
     ${CMAKE_SOURCE_DIR}/src/redpallas.c
@@ -35,11 +35,11 @@ add_library(zcash-orchard-c-deterministic STATIC
     ${CMAKE_SOURCE_DIR}/src/base58.c
     ${CMAKE_SOURCE_DIR}/src/hwp_dispatcher.c
 )
-target_include_directories(zcash-orchard-c-deterministic
+target_include_directories(zcash-ironwood-c-deterministic
     PUBLIC ${CMAKE_SOURCE_DIR}/include
     PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/aes
 )
-target_compile_definitions(zcash-orchard-c-deterministic PRIVATE
+target_compile_definitions(zcash-ironwood-c-deterministic PRIVATE
     TEST_DETERMINISTIC_NONCE
     USE_PLATFORM_RNG=0
     ZORCHARD_INSECURE_LCG=1
@@ -49,43 +49,43 @@ target_compile_definitions(zcash-orchard-c-deterministic PRIVATE
 # silently turn every assert into a no-op and a broken invariant looks
 # identical to a passing test (we hit this in the fee-gate review pass:
 # tests "passed" only because asserts were compiled out).
-target_compile_options(zcash-orchard-c-deterministic PRIVATE -UNDEBUG)
-target_compile_options(zcash-orchard-c-deterministic PRIVATE -Wall -Wextra -Wno-unused-parameter)
+target_compile_options(zcash-ironwood-c-deterministic PRIVATE -UNDEBUG)
+target_compile_options(zcash-ironwood-c-deterministic PRIVATE -Wall -Wextra -Wno-unused-parameter)
 
 # All four tests link against the deterministic variant. Tests that don't
 # touch crypto (test_hwp) get the same library; the redundancy is harmless
 # and the single dependency keeps the build graph simple.
 add_executable(test_hwp test_hwp.c)
-target_link_libraries(test_hwp PRIVATE zcash-orchard-c-deterministic)
+target_link_libraries(test_hwp PRIVATE zcash-ironwood-c-deterministic)
 add_test(NAME test_hwp COMMAND test_hwp)
 
 add_executable(test_orchard test_orchard.c)
-target_link_libraries(test_orchard PRIVATE zcash-orchard-c-deterministic)
+target_link_libraries(test_orchard PRIVATE zcash-ironwood-c-deterministic)
 add_test(NAME test_orchard COMMAND test_orchard)
 
 add_executable(test_signer test_signer.c)
-target_link_libraries(test_signer PRIVATE zcash-orchard-c-deterministic)
+target_link_libraries(test_signer PRIVATE zcash-ironwood-c-deterministic)
 target_include_directories(test_signer PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 target_compile_options(test_signer PRIVATE -UNDEBUG)
 add_test(NAME test_signer COMMAND test_signer)
 
 add_executable(test_vectors test_vectors.c)
-target_link_libraries(test_vectors PRIVATE zcash-orchard-c-deterministic)
+target_link_libraries(test_vectors PRIVATE zcash-ironwood-c-deterministic)
 add_test(NAME test_vectors COMMAND test_vectors)
 
 add_executable(test_ironwood test_ironwood.c)
-target_link_libraries(test_ironwood PRIVATE zcash-orchard-c-deterministic)
+target_link_libraries(test_ironwood PRIVATE zcash-ironwood-c-deterministic)
 target_compile_options(test_ironwood PRIVATE -UNDEBUG)
 add_test(NAME test_ironwood COMMAND test_ironwood)
 
 add_executable(test_h5 test_h5.c)
-target_link_libraries(test_h5 PRIVATE zcash-orchard-c-deterministic)
+target_link_libraries(test_h5 PRIVATE zcash-ironwood-c-deterministic)
 add_test(NAME test_h5 COMMAND test_h5)
 
 add_executable(test_base58 test_base58.c)
-target_link_libraries(test_base58 PRIVATE zcash-orchard-c-deterministic)
+target_link_libraries(test_base58 PRIVATE zcash-ironwood-c-deterministic)
 add_test(NAME test_base58 COMMAND test_base58)
 
 add_executable(test_hwp_dispatcher test_hwp_dispatcher.c)
-target_link_libraries(test_hwp_dispatcher PRIVATE zcash-orchard-c-deterministic)
+target_link_libraries(test_hwp_dispatcher PRIVATE zcash-ironwood-c-deterministic)
 add_test(NAME test_hwp_dispatcher COMMAND test_hwp_dispatcher)

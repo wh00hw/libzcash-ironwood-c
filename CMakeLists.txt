@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(zcash-orchard-c
+project(zcash-ironwood-c
     VERSION 0.1.0
     LANGUAGES C
     DESCRIPTION "Zcash Orchard address generation, signing, and HWP protocol in pure C"
@@ -55,12 +55,12 @@ set(PROTOCOL_SOURCES
 
 # --- Static library ---
 
-add_library(zcash-orchard-c STATIC
+add_library(zcash-ironwood-c STATIC
     ${CRYPTO_SOURCES}
     ${PROTOCOL_SOURCES}
 )
 
-target_include_directories(zcash-orchard-c
+target_include_directories(zcash-ironwood-c
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
@@ -69,7 +69,7 @@ target_include_directories(zcash-orchard-c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/aes
 )
 
-target_compile_options(zcash-orchard-c PRIVATE
+target_compile_options(zcash-ironwood-c PRIVATE
     -Wall -Wextra -Wno-unused-parameter
 )
 
@@ -78,19 +78,19 @@ target_compile_options(zcash-orchard-c PRIVATE
 
 include(GNUInstallDirs)
 
-install(TARGETS zcash-orchard-c
-    EXPORT zcash-orchard-c-targets
+install(TARGETS zcash-ironwood-c
+    EXPORT zcash-ironwood-c-targets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
 
 install(DIRECTORY include/
-    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/zcash-orchard-c
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/zcash-ironwood-c
 )
 
-install(EXPORT zcash-orchard-c-targets
-    FILE zcash-orchard-c-config.cmake
-    NAMESPACE zcash-orchard-c::
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/zcash-orchard-c
+install(EXPORT zcash-ironwood-c-targets
+    FILE zcash-ironwood-c-config.cmake
+    NAMESPACE zcash-ironwood-c::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/zcash-ironwood-c
 )
 
 # --- Stack analysis (optional, GCC only) ---
@@ -98,7 +98,7 @@ install(EXPORT zcash-orchard-c-targets
 option(STACK_ANALYSIS "Enable -fstack-usage for stack bound analysis" OFF)
 
 if(STACK_ANALYSIS)
-    target_compile_options(zcash-orchard-c PRIVATE -fstack-usage)
+    target_compile_options(zcash-ironwood-c PRIVATE -fstack-usage)
 endif()
 
 # --- Tests (optional) ---

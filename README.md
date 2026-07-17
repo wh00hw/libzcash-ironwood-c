@@ -1,6 +1,6 @@
 # libzcash-ironwood-c
 
-> Formerly `libzcash-orchard-c` — renamed after the NU6.3 / Ironwood migration. The CMake project and library target keep the name `zcash-orchard-c` for build compatibility.
+> Formerly `libzcash-orchard-c` — renamed after the NU6.3 / Ironwood migration. The CMake project and library target are named `zcash-ironwood-c` as well (renamed from `zcash-orchard-c` in July 2026 — update `target_link_libraries` when bumping). The `orchard_*` C symbol prefix is intentionally retained: it names the Orchard *protocol/circuit family*, which serves both the sealed Orchard pool and the Ironwood pool — mirroring upstream, where Ironwood lives inside the `orchard` crate.
 
 > **WARNING — Proof of Concept.** This library has **not** been audited. It is published for review and experimentation only. **Do not use it to protect real funds** until an independent security audit has been completed. Use at your own risk.
 
