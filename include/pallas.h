@@ -68,6 +68,15 @@ void pallas_set_sinsemilla_lookup(pallas_sinsemilla_lookup_fn fn, void* ctx);
  */
 bool pallas_verify_sinsemilla_table(void);
 
+/**
+ * Verify the baked-in fixed hash-to-curve outputs (Sinsemilla Q, commitment
+ * blinding bases R, spend-authorization base G — src/pallas_consts.h)
+ * against a from-scratch recomputation. Returns true iff every entry
+ * matches. Optional boot-time self-test, same role as
+ * pallas_verify_sinsemilla_table(); costs one hash-to-curve per entry.
+ */
+bool pallas_verify_fixed_points(void);
+
 // Must call before any Pallas operations
 void pallas_init(void);
 

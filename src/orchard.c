@@ -83,6 +83,26 @@ static void to_scalar(const uint8_t input_le[64], uint8_t output_le[32]) {
     reduce_512_mod(input_le, PALLAS_Q_BE, output_le);
 }
 
+/* g_d = DiversifyHash(d) = hash_to_curve("z.cash:Orchard-gd")(d).
+ *
+ * Verifying one action needs g_d twice — as the first NoteCommit input and
+ * as the base of epk = [esk]·g_d — so the last result is kept. The
+ * diversifier and g_d are public (they are the recipient address), hence
+ * the plain compare and the un-wiped cache. */
+static void orchard_diversify_hash(pallas_point* g_d, const uint8_t d[11]) {
+    static uint8_t cached_d[11];
+    static pallas_point cached_g_d;
+    static bool cached = false;
+
+    if (!cached || memcmp(cached_d, d, 11) != 0) {
+        cached = false;
+        pallas_hash_to_curve(&cached_g_d, "z.cash:Orchard-gd", d, 11);
+        memcpy(cached_d, d, 11);
+        cached = true;
+    }
+    *g_d = cached_g_d;
+}
+
 // ToBase: reduce 64-byte LE value modulo Pallas base field p
 static void to_base(const uint8_t input_le[64], uint8_t output_le[32]) {
     reduce_512_mod(input_le, PALLAS_P_BE, output_le);
@@ -600,7 +620,7 @@ int orchard_derive_unified_address(
         // 6. g_d = DiversifyHash(d)
         pallas_report(72, "DiversifyHash...");
         static pallas_point g_d;
-        pallas_hash_to_curve(&g_d, "z.cash:Orchard-gd", d, 11);
+        orchard_diversify_hash(&g_d, d);
 
         // 7. pk_d = [ivk] * g_d
         pallas_report(80, "Computing pk_d...");
@@ -910,7 +930,7 @@ void orchard_compute_cmx(
     /* bits 0..255 (bytes 0..31): repr_P(g_d) — written in place. */
     {
         pallas_point g_d;
-        pallas_hash_to_curve(&g_d, "z.cash:Orchard-gd", d, 11);
+        orchard_diversify_hash(&g_d, d);
         bn_write_le(&g_d.x, msg + 0);
         if (g_d.y.val[0] & 1) msg[31] |= 0x80;
         memzero(&g_d, sizeof(g_d));
@@ -1142,7 +1162,7 @@ int orchard_compute_enc_ciphertext(
     static const uint8_t zero_nonce[12] = {0};
 
     /* 1. g_d = DiversifyHash(d). Same hash-to-curve used by cmx. */
-    pallas_hash_to_curve(&g_d, "z.cash:Orchard-gd", d, 11);
+    orchard_diversify_hash(&g_d, d);
 
     /* 2. esk as Pallas scalar (the companion-supplied 32 bytes are
      *    treated verbatim, mod q; pallas_point_mul handles reduction). */

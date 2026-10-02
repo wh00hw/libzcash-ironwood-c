@@ -16,7 +16,10 @@ The library does **not** defend against power analysis (DPA/SPA), fault injectio
 
 | Operation | Technique | File | Notes |
 |-----------|-----------|------|-------|
-| Scalar multiplication `[k]*P` | Montgomery ladder with XOR-masked conditional swap | `src/pallas.c` pallas_point_mul() | Fixed iteration count; no branch on scalar bits |
+| Scalar multiplication `[k]*P` | GLV split (`k = k1 + k2·λ`, constant-time Babai rounding) + interleaved fixed-window ladder; table entries selected by a masked scan of all `2^w` entries, signs by masked select | `src/pallas.c` pallas_point_mul() | Fixed iteration count; no branch or memory index depends on the scalar. The zero digit and the initial identity go through the same exception-free RCB addition (audit C-1) |
+| Base-field multiplication / squaring `a * b mod p` | Schoolbook product + folding with `2^254 ≡ -c (mod p)`, masked final subtraction | `src/pallas.c` fp_mul(), fp_sqr(), fp_reduce_wide() | Straight-line limb arithmetic; replaces the data-dependent shift-compare-subtract loop (audit M-3) |
+| Base-field add / sub / negate | Limb chain + masked conditional correction by `p` | `src/pallas.c` fp_add(), fp_sub(), fp_neg() | No branch on the operands |
+| Base-field inversion | Constant-time safegcd: 20 batches of 30 masked divsteps (adapted from libsecp256k1 `modinv32`) | `src/pallas.c` fp_inv() | Fixed 600 divsteps regardless of the value; replaces Fermat exponentiation, which had replaced the variable-time Stein GCD (audit C-1) |
 | Modular reduction `x mod q` | Fixed-iteration conditional subtraction via `bn_cmov()` | `src/redpallas.c` fq_full_reduce() | No variable-length while loops |
 | Field multiplication `a * b mod p` | Shift-and-add with `bn_cmov()` conditional add | `src/redpallas.c` fq_mul() | No branching on secret bits |
 | Nonce-is-zero check | `bn_cmov()` replaces zero with 1 | `src/redpallas.c` generate_nonce() | No `if` branch on nonce value |
@@ -33,8 +36,10 @@ The library does **not** defend against power analysis (DPA/SPA), fault injectio
 
 | Operation | Technique | File | Why it's safe |
 |-----------|-----------|------|---------------|
-| `fp_sqrt()` Tonelli-Shanks | Early return on non-square | `src/pallas.c` | Input is a public curve coordinate, not a secret |
-| `fp_neg()` zero check | Branch on `bn_is_zero()` | `src/pallas.c` | Input is a public field element |
+| `fp_sqrt()` table square root | Early return on zero; result validity reported to the caller (the digit search itself is a full masked scan) | `src/pallas.c` | Input is a public curve coordinate or a hash-to-curve intermediate of public input, not a secret |
+| `pallas_hash_to_curve()` fixed-point lookup | `strcmp`/`memcmp` scan of `PALLAS_FIXED_POINTS` | `src/pallas.c` | Domain strings and messages are public protocol constants |
+| `g_d` cache | `memcmp` on the diversifier, cached point not wiped | `src/orchard.c` orchard_diversify_hash() | The diversifier and `g_d` are the recipient address — public |
+| `pallas_jac_add_mixed()` identity fallback | Branch on the affine operand's `infinity` flag | `src/pallas.c` | The affine operand is a public table point, or `[rcm]·R`, where the flag reveals only `rcm == 0` |
 | `fp_is_square()` Euler criterion | Variable-time exponentiation | `src/pallas.c` | Applied to public hash outputs during hash-to-curve |
 
 ## Stack budget

@@ -89,3 +89,18 @@ add_test(NAME test_base58 COMMAND test_base58)
 add_executable(test_hwp_dispatcher test_hwp_dispatcher.c)
 target_link_libraries(test_hwp_dispatcher PRIVATE zcash-ironwood-c-deterministic)
 add_test(NAME test_hwp_dispatcher COMMAND test_hwp_dispatcher)
+
+# Host micro-benchmark for the Pallas hot path (not a ctest; run manually:
+#   ./tests/bench_pallas ../src/sinsemilla_s.bin).
+add_executable(bench_pallas ${CMAKE_SOURCE_DIR}/tools/bench_pallas.c)
+target_link_libraries(bench_pallas PRIVATE zcash-ironwood-c-deterministic)
+
+add_executable(test_field test_field.c)
+target_link_libraries(test_field PRIVATE zcash-ironwood-c-deterministic)
+target_compile_options(test_field PRIVATE -UNDEBUG)
+add_test(NAME test_field COMMAND test_field)
+
+add_executable(test_curve test_curve.c)
+target_link_libraries(test_curve PRIVATE zcash-ironwood-c-deterministic)
+target_compile_options(test_curve PRIVATE -UNDEBUG)
+add_test(NAME test_curve COMMAND test_curve)
