@@ -1,6 +1,7 @@
 #include "pallas.h"
 #include "blake2b.h"
 #include "pallas_consts.h"
+#include "pallas_fixed_base_table.h"
 #include "pallas_sqrt_table.h"
 #include "memzero.h"
 #include <stdio.h>
@@ -141,6 +142,20 @@ static const uint32_t FP_P[9] = {
     0x00000001, 0x09698768, 0x133e46e6, 0x0d31f812, 0x00000224,
     0x00000000, 0x00000000, 0x00000000, 0x00400000};
 
+/* Value barrier for select masks derived from secret data.
+ *
+ * A mask such as `0u - bit` used as `(a & ~mask) | (b & mask)` is something
+ * an optimizer may recognise as `bit ? b : a` and turn back into a
+ * conditional branch, or into a select between the two POINTERS followed by
+ * a load (a secret-dependent address). clang does both at several -O levels;
+ * GCC, as of 16.2, does not. Passing the mask through a volatile object
+ * hides its 0 / all-ones structure, so the masked arithmetic is emitted as
+ * written. */
+static inline uint32_t ct_mask_barrier(uint32_t mask) {
+    volatile uint32_t v = mask;
+    return v;
+}
+
 /* x -= p if x >= p, in constant time. x must be normalized. */
 static void fp_cond_sub_p(bignum256* x) {
     uint32_t t[BN_LIMBS];
@@ -151,7 +166,7 @@ static void fp_cond_sub_p(bignum256* x) {
         borrow = d >> 31;
     }
     /* borrow == 0  <=>  x >= p  <=>  keep the difference. */
-    uint32_t mask = borrow - 1;
+    uint32_t mask = ct_mask_barrier(borrow - 1);
     for(int k = 0; k < BN_LIMBS; k++) {
         x->val[k] = (x->val[k] & ~mask) | (t[k] & mask);
     }
@@ -922,7 +937,7 @@ static void glv_decompose(
             t[i] = (uint32_t)d;
             borrow = (d >> 32) & 1;
         }
-        uint32_t keep = 0u - (uint32_t)borrow; /* borrow: k < q, keep k */
+        uint32_t keep = ct_mask_barrier(0u - (uint32_t)borrow); /* borrow: k < q, keep k */
         for(int i = 0; i < 8; i++) kw[i] = (kw[i] & keep) | (t[i] & ~keep);
     }
 
@@ -1007,9 +1022,16 @@ static void pallas_mul_select(
     memzero(&ny, sizeof(ny));
 }
 
+/* Scratch shared by pallas_point_mul, pallas_point_mul_fixed and the
+ * fixed-base table self-check (single-threaded, never nested); each user
+ * wipes what it touched before returning. */
+static pallas_jac s_mul_table[PALLAS_MUL_TABLE_LEN];
+static pallas_jac s_mul_acc, s_mul_sel;
+
 void pallas_point_mul(pallas_point* r, const bignum256* k, const pallas_point* p) {
-    static pallas_jac table[PALLAS_MUL_TABLE_LEN];
-    static pallas_jac acc, sel;
+    pallas_jac* const table = s_mul_table;
+    pallas_jac* const acc = &s_mul_acc;
+    pallas_jac* const sel = &s_mul_sel;
     uint32_t mag1[4], mag2[4], neg1, neg2;
 
     glv_decompose(k, mag1, &neg1, mag2, &neg2);
@@ -1023,32 +1045,148 @@ void pallas_point_mul(pallas_point* r, const bignum256* k, const pallas_point* p
         pallas_jac_add(&table[i], &table[i - 1], &table[1]);
     }
 
-    acc = table[0];
+    *acc = table[0];
 
     const int windows = (128 + PALLAS_POINT_MUL_WINDOW - 1) / PALLAS_POINT_MUL_WINDOW;
     for(int win = windows - 1; win >= 0; win--) {
         for(int d = 0; d < PALLAS_POINT_MUL_WINDOW; d++) {
-            pallas_jac_double(&acc, &acc);
+            pallas_jac_double(acc, acc);
         }
 
-        pallas_mul_select(&sel, table, mag1, win, neg1);
-        pallas_jac_add(&acc, &acc, &sel);
+        pallas_mul_select(sel, table, mag1, win, neg1);
+        pallas_jac_add(acc, acc, sel);
 
-        pallas_mul_select(&sel, table, mag2, win, neg2);
-        fp_mul(&sel.x, &sel.x, &FP_ZETA); /* φ */
-        pallas_jac_add(&acc, &acc, &sel);
+        pallas_mul_select(sel, table, mag2, win, neg2);
+        fp_mul(&sel->x, &sel->x, &FP_ZETA); /* φ */
+        pallas_jac_add(acc, acc, sel);
 
         pallas_yield();
     }
-    pallas_from_jac(r, &acc);
+    pallas_from_jac(r, acc);
 
     // Wipe table, accumulators and the split scalar (statics live in BSS)
-    memzero(table, sizeof(table));
-    memzero(&acc, sizeof(acc));
-    memzero(&sel, sizeof(sel));
+    memzero(s_mul_table, sizeof(s_mul_table));
+    memzero(acc, sizeof(*acc));
+    memzero(sel, sizeof(*sel));
     memzero(mag1, sizeof(mag1));
     memzero(mag2, sizeof(mag2));
     neg1 = neg2 = 0;
+}
+
+// Constant-time fixed-base scalar multiplication: Lim-Lee comb.
+//
+// For the bases that never change — the spend-authorization base G and the
+// commitment blinding bases R — the multiples a ladder would compute by
+// doubling are precomputed (src/pallas_fixed_base_table.h). The 256-bit
+// scalar is cut into TEETH·BLOCKS pieces of SPACING bits; column j of block
+// u gathers bit j of that block's TEETH pieces into one 4-bit digit, and
+//
+//   [k]B = sum_j 2^j · sum_u TABLE[u][digit(u, j)]
+//
+// is evaluated most significant column first: SPACING doublings and
+// 256 / TEETH mixed additions in all (32 + 64 at BLOCKS = 2, against
+// 128 doublings + 64 additions + the 14 that build the table in
+// pallas_point_mul). No GLV split, and no table built at run time.
+//
+// The idea of trading a table for the doublings of a fixed base is the one
+// behind zakura-pasta-curves' `PreparedFixedBaseSum` (glv/fixed_base.rs,
+// zakura-core/common commit 9c9e9e02: doubling-free signed 7-bit windows,
+// "about 76 KiB per base", variable-time, public scalars). Only the idea is
+// shared. This is a different construction, sized for a microcontroller
+// image (2160 B per base) and constant-time, because its scalars are ask,
+// rsk, the RedPallas nonce, rivk and rcm:
+//
+//   - which scalar bits form a digit depends only on the loop counters;
+//   - the table entry is picked by scanning all 15 entries under a mask,
+//     never by indexing with the digit;
+//   - digit 0 runs the same mixed addition as any other digit (on table
+//     entry 1, as a dummy) and its result is discarded by a masked select;
+//   - the RCB formulas are complete, so the identity accumulator of the
+//     first columns and any doubling case take the same path.
+//
+// The scalar may be any value below 2^256; it is not reduced mod q, the
+// comb simply multiplies by the integer.
+_Static_assert(PALLAS_COMB_TEETH * PALLAS_COMB_BLOCKS * PALLAS_COMB_SPACING == 256,
+               "comb must cover 256 scalar bits");
+_Static_assert(PALLAS_COMB_BASES == PALLAS_FIXED_BASE_COUNT, "one comb table per fixed base");
+_Static_assert(PALLAS_MUL_TABLE_LEN >= PALLAS_COMB_TEETH, "scratch reused by the table self-check");
+
+void pallas_point_mul_fixed(pallas_point* r, const bignum256* k, pallas_fixed_base base) {
+    pallas_jac* const acc = &s_mul_acc;
+    pallas_jac* const sum = &s_mul_sel;
+    pallas_point sel;
+    uint8_t kb[32];
+    /* The current digit lives only in these two objects (and in registers
+     * between calls); being volatile they are real stack slots that the
+     * stores before returning are guaranteed to clear. */
+    volatile uint32_t want_v = 0, keep_v = 0;
+
+    /* The base is a public compile-time constant at every call site. An
+     * unknown one fails closed: the identity, never another generator. */
+    if((unsigned)base >= PALLAS_COMB_BASES) {
+        pallas_point_set_infinity(r);
+        return;
+    }
+    const pallas_comb_point (*table)[PALLAS_COMB_ENTRIES] = PALLAS_COMB_TABLE[(unsigned)base];
+
+    bn_write_le(k, kb);
+
+    bn_zero(&acc->x);
+    bn_one(&acc->y);
+    bn_zero(&acc->z);
+    sel.infinity = 0;
+
+    for(int j = PALLAS_COMB_SPACING - 1; j >= 0; j--) {
+        pallas_jac_double(acc, acc);
+
+        for(int u = 0; u < PALLAS_COMB_BLOCKS; u++) {
+            uint32_t digit = 0;
+            for(int t = 0; t < PALLAS_COMB_TEETH; t++) {
+                int bit = (t * PALLAS_COMB_BLOCKS + u) * PALLAS_COMB_SPACING + j;
+                digit |= (((uint32_t)kb[bit >> 3] >> (bit & 7)) & 1u) << t;
+            }
+
+            /* sel = table[u][digit - 1]; digit 0 has no entry (an affine
+             * point cannot be the identity) and reads entry 1 as a dummy. */
+            {
+                const uint32_t is_zero = (digit - 1u) >> 31; /* 1 iff digit == 0 */
+                want_v = digit | is_zero;
+                keep_v = 0u - is_zero;
+            }
+            memzero(&sel.x, sizeof(sel.x));
+            memzero(&sel.y, sizeof(sel.y));
+            for(uint32_t i = 0; i < PALLAS_COMB_ENTRIES; i++) {
+                /* mask = all-ones iff i + 1 == want */
+                uint32_t mask = 0u - ((((i + 1u) ^ want_v) - 1u) >> 31);
+                for(int l = 0; l < BN_LIMBS; l++) {
+                    sel.x.val[l] |= table[u][i].x.val[l] & mask;
+                    sel.y.val[l] |= table[u][i].y.val[l] & mask;
+                }
+            }
+
+            pallas_jac_add_mixed(sum, acc, &sel);
+
+            /* acc = digit != 0 ? sum : acc. Reading the mask back from the
+             * volatile slot is also the value barrier (ct_mask_barrier):
+             * without it clang folds this into a select of the two pointers
+             * followed by a load. */
+            const uint32_t keep = keep_v;
+            for(int l = 0; l < BN_LIMBS; l++) {
+                acc->x.val[l] = (acc->x.val[l] & keep) | (sum->x.val[l] & ~keep);
+                acc->y.val[l] = (acc->y.val[l] & keep) | (sum->y.val[l] & ~keep);
+                acc->z.val[l] = (acc->z.val[l] & keep) | (sum->z.val[l] & ~keep);
+            }
+        }
+        pallas_yield();
+    }
+    pallas_from_jac(r, acc);
+
+    memzero(acc, sizeof(*acc));
+    memzero(sum, sizeof(*sum));
+    memzero(&sel, sizeof(sel));
+    memzero(kb, sizeof(kb));
+    want_v = 0;
+    keep_v = 0;
 }
 
 // ============================================================
@@ -1331,6 +1469,59 @@ void pallas_hash_to_curve(pallas_point* r, const char* domain, const uint8_t* ms
     hash_to_curve_compute(r, domain, msg, msg_len);
 }
 
+/* Which hash-to-curve output each comb table belongs to, in
+ * pallas_fixed_base order. */
+static const struct {
+    const char* domain;
+    const char* msg;
+} PALLAS_FIXED_BASES[PALLAS_FIXED_BASE_COUNT] = {
+    [PALLAS_BASE_SPEND_AUTH_G] = {"z.cash:Orchard", "G"},
+    [PALLAS_BASE_NOTE_COMMIT_R] = {"z.cash:Orchard-NoteCommit-r", ""},
+    [PALLAS_BASE_COMMIT_IVK_R] = {"z.cash:Orchard-CommitIvk-r", ""},
+};
+
+/* Rebuild the comb table of one base from the base point itself (taken
+ * from a fresh hash-to-curve, not from pallas_consts.h) and compare every
+ * entry. Returns 0 iff all match. Public data throughout. */
+static int fixed_base_table_diff(unsigned base) {
+    pallas_jac* const tooth = s_mul_table; /* [2^((t·BLOCKS + u)·SPACING)]B */
+    pallas_jac* const run = &s_mul_acc;
+    pallas_jac* const sum = &s_mul_sel;
+    pallas_point pt;
+    int diff = 0;
+
+    for(int u = 0; u < PALLAS_COMB_BLOCKS; u++) {
+        hash_to_curve_compute(
+            &pt, PALLAS_FIXED_BASES[base].domain,
+            (const uint8_t*)PALLAS_FIXED_BASES[base].msg,
+            strlen(PALLAS_FIXED_BASES[base].msg));
+        pallas_to_jac(run, &pt);
+        for(int m = 0; m < PALLAS_COMB_TEETH * PALLAS_COMB_BLOCKS; m++) {
+            if(m % PALLAS_COMB_BLOCKS == u) tooth[m / PALLAS_COMB_BLOCKS] = *run;
+            for(int i = 0; i < PALLAS_COMB_SPACING; i++) pallas_jac_double(run, run);
+        }
+
+        for(uint32_t d = 1; d <= PALLAS_COMB_ENTRIES; d++) {
+            bn_zero(&sum->x);
+            bn_one(&sum->y);
+            bn_zero(&sum->z);
+            for(int t = 0; t < PALLAS_COMB_TEETH; t++) {
+                if((d >> t) & 1u) pallas_jac_add(sum, sum, &tooth[t]);
+            }
+            pallas_from_jac(&pt, sum);
+            const pallas_comb_point* e = &PALLAS_COMB_TABLE[base][u][d - 1];
+            diff |= pt.infinity;
+            diff |= !bn_is_equal(&pt.x, &e->x);
+            diff |= !bn_is_equal(&pt.y, &e->y);
+        }
+    }
+
+    memzero(s_mul_table, sizeof(s_mul_table));
+    memzero(run, sizeof(*run));
+    memzero(sum, sizeof(*sum));
+    return diff;
+}
+
 bool pallas_verify_fixed_points(void) {
     int diff = 0;
     for(size_t i = 0; i < PALLAS_FIXED_POINTS_COUNT; i++) {
@@ -1341,6 +1532,9 @@ bool pallas_verify_fixed_points(void) {
         bn_write_le(&p.x, xy);
         bn_write_le(&p.y, xy + 32);
         for(int j = 0; j < 64; j++) diff |= xy[j] ^ fp->xy[j];
+    }
+    for(unsigned b = 0; b < PALLAS_FIXED_BASE_COUNT; b++) {
+        diff |= fixed_base_table_diff(b);
     }
     return diff == 0;
 }
@@ -1498,15 +1692,21 @@ void sinsemilla_short_commit(
     static pallas_point S;
     sinsemilla_hash_to_point(&S, m_domain, msg_bits, num_bits);
 
-    // R = hash_to_curve(domain + "-r")(&[])
-    char r_domain[128] = {0};
-    snprintf(r_domain, sizeof(r_domain), "%s-r", domain);
-    static pallas_point R;
-    pallas_hash_to_curve(&R, r_domain, (const uint8_t*)"", 0);
-
-    // commit = S + [rcm] * R
+    // commit = S + [rcm] * R, with R = hash_to_curve(domain + "-r")(&[]).
+    // The two protocol domains have a comb table for R; the domain string
+    // is a public constant, so choosing the path by it leaks nothing.
     static pallas_point rcm_R;
-    pallas_point_mul(&rcm_R, rcm, &R);
+    if(strcmp(domain, "z.cash:Orchard-NoteCommit") == 0) {
+        pallas_point_mul_fixed(&rcm_R, rcm, PALLAS_BASE_NOTE_COMMIT_R);
+    } else if(strcmp(domain, "z.cash:Orchard-CommitIvk") == 0) {
+        pallas_point_mul_fixed(&rcm_R, rcm, PALLAS_BASE_COMMIT_IVK_R);
+    } else {
+        char r_domain[128] = {0};
+        snprintf(r_domain, sizeof(r_domain), "%s-r", domain);
+        static pallas_point R;
+        pallas_hash_to_curve(&R, r_domain, (const uint8_t*)"", 0);
+        pallas_point_mul(&rcm_R, rcm, &R);
+    }
 
     static pallas_jac j;
     pallas_to_jac(&j, &S);

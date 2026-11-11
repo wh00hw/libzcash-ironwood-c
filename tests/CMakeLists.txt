@@ -52,6 +52,12 @@ target_compile_definitions(zcash-ironwood-c-deterministic PRIVATE
 target_compile_options(zcash-ironwood-c-deterministic PRIVATE -UNDEBUG)
 target_compile_options(zcash-ironwood-c-deterministic PRIVATE -Wall -Wextra -Wno-unused-parameter)
 
+# Asserts are the failure-detection mechanism of every test binary, not only
+# of the library variant above: keep them live in every configuration
+# (Release adds -DNDEBUG; this comes later on the command line and wins).
+# Applies to all targets defined below in this directory.
+add_compile_options(-UNDEBUG)
+
 # All four tests link against the deterministic variant. Tests that don't
 # touch crypto (test_hwp) get the same library; the redundancy is harmless
 # and the single dependency keeps the build graph simple.

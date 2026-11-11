@@ -556,12 +556,9 @@ int orchard_derive_unified_address(
         static bignum256 ask_bn;
         bn_read_le(ask_le, &ask_bn);
 
-        static pallas_point G_spend;
-        pallas_group_hash(&G_spend, "z.cash:Orchard", (const uint8_t*)"G", 1);
-
         pallas_report(15, "Scalar mul [ask]*G");
         static pallas_point ak;
-        pallas_point_mul(&ak, &ask_bn, &G_spend);
+        pallas_point_mul_fixed(&ak, &ask_bn, PALLAS_BASE_SPEND_AUTH_G);
 
         // 3. IVK = SinsemillaShortCommit
         pallas_report(35, "Sinsemilla IVK...");
@@ -650,7 +647,6 @@ int orchard_derive_unified_address(
         memzero(&ak, sizeof(ak));
         memzero(&g_d, sizeof(g_d));
         memzero(&pk_d, sizeof(pk_d));
-        memzero(&G_spend, sizeof(G_spend));
     }
 
 

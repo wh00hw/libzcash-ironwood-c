@@ -71,9 +71,17 @@ bool pallas_verify_sinsemilla_table(void);
 /**
  * Verify the baked-in fixed hash-to-curve outputs (Sinsemilla Q, commitment
  * blinding bases R, spend-authorization base G — src/pallas_consts.h)
- * against a from-scratch recomputation. Returns true iff every entry
- * matches. Optional boot-time self-test, same role as
- * pallas_verify_sinsemilla_table(); costs one hash-to-curve per entry.
+ * and the fixed-base comb tables (src/pallas_fixed_base_table.h) against a
+ * from-scratch recomputation. Returns true iff every entry matches.
+ * Optional boot-time self-test, same role as
+ * pallas_verify_sinsemilla_table(); costs one hash-to-curve per point plus,
+ * per comb table, about 500 doublings and 30 inversions (roughly three
+ * times the cost of the point check alone).
+ *
+ * Nothing calls this automatically: it is a self-check for the integrator
+ * to run (typically once at boot). It uses the same static scratch as
+ * pallas_point_mul() / pallas_point_mul_fixed() and, like the rest of the
+ * library, must not run concurrently with any other library call.
  */
 bool pallas_verify_fixed_points(void);
 
@@ -101,6 +109,20 @@ void pallas_jac_double(pallas_jac* r, const pallas_jac* p);
 void pallas_jac_add(pallas_jac* r, const pallas_jac* a, const pallas_jac* b);
 void pallas_jac_add_mixed(pallas_jac* r, const pallas_jac* p, const pallas_point* q);
 void pallas_point_mul(pallas_point* r, const bignum256* k, const pallas_point* p);
+
+// Fixed bases with a precomputed comb table (src/pallas_fixed_base_table.h).
+typedef enum {
+    PALLAS_BASE_SPEND_AUTH_G = 0,  // hash_to_curve("z.cash:Orchard")("G")
+    PALLAS_BASE_NOTE_COMMIT_R = 1, // hash_to_curve("z.cash:Orchard-NoteCommit-r")("")
+    PALLAS_BASE_COMMIT_IVK_R = 2,  // hash_to_curve("z.cash:Orchard-CommitIvk-r")("")
+    PALLAS_FIXED_BASE_COUNT = 3
+} pallas_fixed_base;
+
+// r = [k]B for one of the fixed bases above; same result as
+// pallas_point_mul(r, k, B), constant-time in k, about twice as fast.
+// k may be any value below 2^256. `base` is public; a value outside the
+// enum yields the point at infinity.
+void pallas_point_mul_fixed(pallas_point* r, const bignum256* k, pallas_fixed_base base);
 
 // Hash to curve
 void pallas_hash_to_curve(pallas_point* r, const char* domain, const uint8_t* msg, size_t msg_len);

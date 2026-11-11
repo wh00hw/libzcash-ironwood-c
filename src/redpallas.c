@@ -146,14 +146,13 @@ void redpallas_derive_ak(const uint8_t ask[32], uint8_t ak_out[32]) {
 
     // Static to reduce stack pressure on constrained devices
     static bignum256 ask_bn;
-    static pallas_point G_spend, ak;
+    static pallas_point ak;
 
     bn_read_le(ask, &ask_bn);
     fq_full_reduce(&ask_bn);
 
-    pallas_group_hash(&G_spend, "z.cash:Orchard", (const uint8_t*)"G", 1);
-
-    pallas_point_mul(&ak, &ask_bn, &G_spend);
+    /* G_SpendAuth = hash_to_curve("z.cash:Orchard")("G"), via its comb table */
+    pallas_point_mul_fixed(&ak, &ask_bn, PALLAS_BASE_SPEND_AUTH_G);
 
     // Orchard protocol §4.2.3: SpendValidatingKey is normalized so that
     // the sign bit of the encoded ak is 0. If [ask]*G has sign bit 1,
@@ -175,7 +174,6 @@ void redpallas_derive_ak(const uint8_t ask[32], uint8_t ak_out[32]) {
 
     memzero(&ask_bn, sizeof(ask_bn));
     memzero(&ak, sizeof(ak));
-    memzero(&G_spend, sizeof(G_spend));
 }
 
 int redpallas_sign(
@@ -194,7 +192,7 @@ int redpallas_sign(
     static bignum256 ask_bn, alpha_bn, rsk, nonce;
     static bignum256 challenge, c_times_rsk, S_scalar;
     static bignum256 q_minus_ask, ak_y_red;       /* H-2: ask normalization */
-    static pallas_point G_spend, ak_check, rk, R; /* H-2: ak_check */
+    static pallas_point ak_check, rk, R;          /* H-2: ak_check */
     static blake2b_state S_hash;
     static uint8_t challenge_raw[64];
     static uint8_t R_bytes[32];
@@ -206,8 +204,9 @@ int redpallas_sign(
     bn_read_le(alpha, &alpha_bn);
     fq_full_reduce(&alpha_bn);
 
-    // Get SpendAuth generator
-    pallas_group_hash(&G_spend, "z.cash:Orchard", (const uint8_t*)"G", 1);
+    // SpendAuth generator G = hash_to_curve("z.cash:Orchard")("G"): every
+    // multiplication below goes through its constant-time comb table
+    // (pallas_point_mul_fixed, PALLAS_BASE_SPEND_AUTH_G).
 
     /* ===== H-2 fix: ak normalization =====================================
      * Per Orchard spec §4.2.3 and librustzcash SpendAuthorizingKey::from(),
@@ -225,18 +224,18 @@ int redpallas_sign(
      * the seeds would silently produce signatures the network rejects.
      *
      * We apply the same conditional negation to ask itself, in constant time:
-     *   1. compute ak_check = [ask]·G  (one extra point_mul, ~1s on ESP32-S2)
+     *   1. compute ak_check = [ask]·G  (one extra fixed-base multiplication)
      *   2. test parity of ak_check.y mod p
      *   3. cmov ask ← q - ask   when y-bit is 1
      *
      * The check is constant-time because q_minus_ask is computed
      * unconditionally and bn_cmov selects in constant time. The point
-     * multiplication itself runs through pallas_point_mul, whose constant-
+     * multiplication itself runs through pallas_point_mul_fixed, whose constant-
      * time properties are tracked separately (audit C-1 / H-1).
      *
      * Audit: docs/security-audit/01-crypto-c-primitives.md H-2.
      */
-    pallas_point_mul(&ak_check, &ask_bn, &G_spend);
+    pallas_point_mul_fixed(&ak_check, &ask_bn, PALLAS_BASE_SPEND_AUTH_G);
     bn_subtract(pallas_q(), &ask_bn, &q_minus_ask);
     bn_copy(&ak_check.y, &ak_y_red);
     bn_mod(&ak_y_red, pallas_p());
@@ -252,7 +251,7 @@ int redpallas_sign(
     pallas_report(10, "Computing rk...");
 
     // rk = [rsk] * G_SpendAuth
-    pallas_point_mul(&rk, &rsk, &G_spend);
+    pallas_point_mul_fixed(&rk, &rsk, PALLAS_BASE_SPEND_AUTH_G);
     pallas_point_encode(rk_out, &rk);
 
     pallas_report(40, "Computing nonce...");
@@ -264,7 +263,7 @@ int redpallas_sign(
     pallas_report(50, "Computing R...");
 
     // R = [nonce] * G_SpendAuth
-    pallas_point_mul(&R, &nonce, &G_spend);
+    pallas_point_mul_fixed(&R, &nonce, PALLAS_BASE_SPEND_AUTH_G);
     pallas_point_encode(R_bytes, &R);
 
     pallas_report(80, "Computing S...");
@@ -307,7 +306,6 @@ int redpallas_sign(
     memzero(R_bytes, sizeof(R_bytes));
     memzero(rsk_bytes, sizeof(rsk_bytes));
     memzero(&S_hash, sizeof(S_hash));
-    memzero(&G_spend, sizeof(G_spend));
     memzero(&ak_check, sizeof(ak_check));         /* H-2 */
     memzero(&rk, sizeof(rk));
     memzero(&R, sizeof(R));

@@ -2,7 +2,8 @@
  *
  * Times the primitives that dominate per-action verification on the device
  * (field mul/inv/sqrt, hash-to-curve, scalar multiplication, Sinsemilla,
- * cmx and enc_ciphertext recomputation). Host numbers are only meaningful
+ * cmx and enc_ciphertext recomputation) and the signing side (RedPallas
+ * spend authorization, ak and address derivation). Host numbers are only meaningful
  * as ratios between two builds of the library; absolute device timings
  * need the same loop driven from the target's tick source.
  *
@@ -16,6 +17,7 @@
 
 #include "orchard.h"
 #include "pallas.h"
+#include "redpallas.h"
 
 static double now_ms(void) {
     struct timespec ts;
@@ -114,6 +116,26 @@ int main(int argc, char** argv) {
             d, pk_d, 12345, rseed, rho, memo, ORCHARD_NOTE_V3, enc, epk);
     });
 
-    printf("checksum %02x%02x%02x%02x\n", cmx[0], enc[0], epk[0], (unsigned)(r.val[0] & 0xff));
+    /* Signing side. ask/alpha are arbitrary scalars below q. */
+    uint8_t ask[32], alpha[32], sighash[32], sig[64], rk[32], ak[32];
+    memcpy(ask, a_le, 32);
+    memcpy(alpha, b_le, 32);
+    memset(sighash, 0x77, 32);
+    BENCH("redpallas_sign", 2000,
+          (sighash[0]++, alpha[0]++, redpallas_sign(ask, alpha, sighash, sig, rk)));
+    BENCH("redpallas_derive_ak", 2000, (ask[0]++, redpallas_derive_ak(ask, ak)));
+    {
+        static uint8_t seed[64];
+        static char ua[256];
+        uint8_t d_out[11], pk_d_out[32];
+        memset(seed, 0x31, sizeof(seed));
+        BENCH("orchard_derive_unified_address", 500,
+              (seed[0]++, orchard_derive_unified_address(
+                              seed, 133, 0, "u", ua, sizeof(ua), d_out, pk_d_out)));
+        cmx[0] ^= pk_d_out[0];
+    }
+
+    printf("checksum %02x%02x%02x%02x %02x%02x\n", cmx[0], enc[0], epk[0],
+           (unsigned)(r.val[0] & 0xff), sig[0] ^ sig[63], rk[0] ^ ak[0]);
     return 0;
 }

@@ -1,7 +1,7 @@
 /* Differential tests for the Pallas group operations.
  *
- * pallas_point_mul (fixed-window, table based) and pallas_jac_add_mixed
- * (RCB mixed addition) are checked against the plainest possible reference:
+ * pallas_point_mul (fixed-window, table based), pallas_point_mul_fixed
+ * (fixed-base comb) and pallas_jac_add_mixed (RCB mixed addition) are checked against the plainest possible reference:
  * bit-by-bit double-and-add built on the fully projective addition. */
 #include <assert.h>
 #include <stdio.h>
@@ -108,6 +108,81 @@ int main(void) {
         pallas_point next;
         pallas_point_mul(&next, &k, &base);
         if(!next.infinity) base = next;
+    }
+
+    /* fixed-base comb == reference double-and-add, for every table.
+     * Single-bit scalars exercise each comb position on its own; the edge
+     * scalars cover the identity result, the all-zero and all-one digits. */
+    {
+        static const struct {
+            pallas_fixed_base id;
+            const char* domain;
+            const char* msg;
+        } bases[PALLAS_FIXED_BASE_COUNT] = {
+            {PALLAS_BASE_SPEND_AUTH_G, "z.cash:Orchard", "G"},
+            {PALLAS_BASE_NOTE_COMMIT_R, "z.cash:Orchard-NoteCommit-r", ""},
+            {PALLAS_BASE_COMMIT_IVK_R, "z.cash:Orchard-CommitIvk-r", ""},
+        };
+        /* an unknown base fails closed: the identity, not some other
+         * generator's multiple */
+        {
+            pallas_point got;
+            bn_one(&k);
+            got.infinity = 0;
+            pallas_point_mul_fixed(&got, &k, PALLAS_FIXED_BASE_COUNT);
+            assert(got.infinity);
+            got.infinity = 0;
+            pallas_point_mul_fixed(&got, &k, (pallas_fixed_base)-1);
+            assert(got.infinity);
+            got.infinity = 0;
+            pallas_point_mul_fixed(&got, &k, (pallas_fixed_base)(PALLAS_FIXED_BASE_COUNT + 3));
+            assert(got.infinity);
+        }
+
+        for(int b = 0; b < PALLAS_FIXED_BASE_COUNT; b++) {
+            pallas_point B, want, got;
+            pallas_hash_to_curve(
+                &B, bases[b].domain, (const uint8_t*)bases[b].msg, strlen(bases[b].msg));
+
+            bn_zero(&k);
+            pallas_point_mul_fixed(&got, &k, bases[b].id);
+            assert(got.infinity);
+            bn_one(&k);
+            pallas_point_mul_fixed(&got, &k, bases[b].id);
+            assert(point_eq(&got, &B));
+            bn_copy(pallas_q(), &k);
+            pallas_point_mul_fixed(&got, &k, bases[b].id);
+            assert(got.infinity);
+            k.val[0] -= 1; /* q - 1: -B */
+            pallas_point_mul_fixed(&got, &k, bases[b].id);
+            assert(!got.infinity && bn_is_equal(&got.x, &B.x) && !bn_is_equal(&got.y, &B.y));
+            k.val[0] += 2; /* q + 1: B */
+            pallas_point_mul_fixed(&got, &k, bases[b].id);
+            assert(point_eq(&got, &B));
+            for(int i = 0; i < BN_LIMBS - 1; i++) k.val[i] = BN_LIMB_MASK;
+            k.val[BN_LIMBS - 1] = (1u << BN_BITS_LAST_LIMB) - 1; /* 2^256 - 1 */
+            ref_mul(&want, &k, &B);
+            pallas_point_mul_fixed(&got, &k, bases[b].id);
+            assert(point_eq(&want, &got));
+
+            for(int bit = 0; bit < 256; bit++) {
+                bn_zero(&k);
+                bn_setbit(&k, (uint16_t)bit);
+                ref_mul(&want, &k, &B);
+                pallas_point_mul_fixed(&got, &k, bases[b].id);
+                assert(point_eq(&want, &got));
+            }
+
+            for(int i = 0; i < 700; i++) {
+                random_scalar(&k);
+                ref_mul(&want, &k, &B);
+                pallas_point_mul_fixed(&got, &k, bases[b].id);
+                assert(point_eq(&want, &got));
+                /* and the variable-base path agrees on the same base */
+                pallas_point_mul(&got, &k, &B);
+                assert(point_eq(&want, &got));
+            }
+        }
     }
 
     /* mixed addition == projective addition, including P + P, P + (-P),

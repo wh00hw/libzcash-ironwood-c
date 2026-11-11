@@ -91,7 +91,7 @@ for su_file in $SU_FILES; do
             echo "${size}	${func}	$(basename "$su_file" .su)"
         fi
     done < "$su_file"
-done | sort -rn | head -10 | while IFS=$'\t' read -r sz fn fl; do
+done | sort -rn | sed -n '1,10p' | while IFS=$'\t' read -r sz fn fl; do
     printf "  %6d bytes  %-40s  %s\n" "$sz" "$fn" "$fl"
 done
 
