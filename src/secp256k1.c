@@ -89,6 +89,9 @@ void secp256k1_from_jac(secp256k1_point *p, const secp256k1_jac *j) {
     sfp_mul(&zinv3, &zinv2, &zinv);
     sfp_mul(&p->x, &j->x, &zinv2);
     sfp_mul(&p->y, &j->y, &zinv3);
+    memzero(&zinv, sizeof(zinv));
+    memzero(&zinv2, sizeof(zinv2));
+    memzero(&zinv3, sizeof(zinv3));
 }
 
 /* Double: 2P in Jacobian (a=0, same formulas as Pallas) */
@@ -132,6 +135,11 @@ void secp256k1_jac_double(secp256k1_jac *r, const secp256k1_jac *p) {
     bn_copy(&x3, &r->x);
     bn_copy(&y3, &r->y);
     bn_copy(&z3, &r->z);
+
+    /* statics: the ladder's last intermediates must not outlive the call */
+    memzero(&a, sizeof(a)); memzero(&b, sizeof(b)); memzero(&c, sizeof(c));
+    memzero(&d, sizeof(d)); memzero(&e, sizeof(e)); memzero(&f, sizeof(f));
+    memzero(&x3, sizeof(x3)); memzero(&y3, sizeof(y3)); memzero(&z3, sizeof(z3));
 }
 
 /* Mixed add: J + affine P */
@@ -150,7 +158,10 @@ void secp256k1_jac_add_mixed(secp256k1_jac *r, const secp256k1_jac *j, const sec
     sfp_sub(&rr, &s2, &j->y);
 
     if (bn_is_zero(&h)) {
-        if (bn_is_zero(&rr)) {
+        int same = bn_is_zero(&rr);
+        memzero(&z2, sizeof(z2)); memzero(&u2, sizeof(u2)); memzero(&s2, sizeof(s2));
+        memzero(&h, sizeof(h)); memzero(&rr, sizeof(rr)); memzero(&tmp, sizeof(tmp));
+        if (same) {
             secp256k1_jac_double(r, j);
             return;
         }
@@ -177,6 +188,11 @@ void secp256k1_jac_add_mixed(secp256k1_jac *r, const secp256k1_jac *j, const sec
     bn_copy(&x3, &r->x);
     bn_copy(&y3, &r->y);
     bn_copy(&z3, &r->z);
+
+    memzero(&z2, sizeof(z2)); memzero(&u2, sizeof(u2)); memzero(&s2, sizeof(s2));
+    memzero(&h, sizeof(h)); memzero(&rr, sizeof(rr)); memzero(&hh, sizeof(hh));
+    memzero(&hhh, sizeof(hhh)); memzero(&v, sizeof(v)); memzero(&tmp, sizeof(tmp));
+    memzero(&x3, sizeof(x3)); memzero(&y3, sizeof(y3)); memzero(&z3, sizeof(z3));
 }
 
 /* Constant-time Montgomery ladder: r = k * p */

@@ -427,6 +427,8 @@ void f4jumble(uint8_t* data, size_t len) {
     // Now a = c
 
     // Result: c || d = a || b (in-place)
+    // The scratch holds keystream derived from the (un)jumbled address.
+    memzero(buf, sizeof(buf));
 }
 
 void f4jumble_inv(uint8_t* data, size_t len) {
@@ -461,6 +463,8 @@ void f4jumble_inv(uint8_t* data, size_t len) {
     // Now d = b
 
     // Result: a || b = c || d (in-place)
+    // The scratch holds keystream derived from the (un)jumbled address.
+    memzero(buf, sizeof(buf));
 }
 
 // ============================================================
@@ -524,7 +528,9 @@ static size_t convert_bits_8to5(
 
 // Address generation is done via orchard_derive_unified_address() below
 
-int orchard_derive_unified_address(
+/* Shared body of orchard_derive_unified_address() and its _legacy variant.
+ * `legacy_dk` selects the pre-fix diversifier-key input (see step 4). */
+static int derive_unified_address(
     const uint8_t seed[64],
     uint32_t coin_type,
     uint32_t account,
@@ -532,7 +538,8 @@ int orchard_derive_unified_address(
     char* ua_out,
     size_t ua_out_len,
     uint8_t* d_out,
-    uint8_t* pk_d_out) {
+    uint8_t* pk_d_out,
+    bool legacy_dk) {
 
     pallas_init();
 
@@ -588,10 +595,24 @@ int orchard_derive_unified_address(
         static bignum256 ivk;
         bn_copy(&ivk_x, &ivk);
 
-        // 4. dk
+        // 4. dk = first half of PRF^expand_rivk([0x82] || I2LEOSP_256(ak) ||
+        //    I2LEOSP_256(nk))  (protocol spec §4.2.3, Orchard key components).
+        //
+        // `ak` there is the spend validating key as it appears in the full
+        // viewing key: repr_P of the point with ỹ = 0 — when [ask]G has an
+        // odd y the spec negates ask, so the encoded sign bit is always 0.
+        // The point computed above is the un-normalised [ask]G; its x is the
+        // same either way (and x < p < 2^255 leaves bit 255 clear), so the
+        // normalised encoding is simply x with the sign bit left at 0.
+        //
+        // Releases up to a55d168 copied the sign of the un-normalised point
+        // into bit 255 instead. For seeds whose [ask]G has odd y (about half)
+        // that gave a different dk, hence a default diversifier that no
+        // wallet deriving from the FVK would pick. `legacy_dk` reproduces
+        // that behaviour for orchard_derive_unified_address_legacy().
         static uint8_t ak_compressed[32];
         bn_write_le(&ak.x, ak_compressed);
-        if(ak.y.val[0] & 1) ak_compressed[31] |= 0x80;
+        if(legacy_dk && (ak.y.val[0] & 1)) ak_compressed[31] |= 0x80;
         static uint8_t dk[32];
         {
             static uint8_t prf_dk_out[64];
@@ -689,13 +710,45 @@ int orchard_derive_unified_address(
     size_t data5_len = convert_bits_8to5(raw_ua, raw_len, data5, sizeof(data5));
 
     // Use bech32_encode directly (not segwit_addr_encode which has length limits)
-    if(ua_out_len < 200) return 0;
-    int ok = bech32_encode(ua_out, hrp, data5, data5_len, BECH32_ENCODING_BECH32M);
+    int ok = ua_out_len >= 200 &&
+             bech32_encode(ua_out, hrp, data5, data5_len, BECH32_ENCODING_BECH32M);
+
+    // Secrets were cleared in the computation block above. The address
+    // itself is not secret, but it identifies the wallet: do not leave
+    // copies of it in static storage either.
+    memzero(d, sizeof(d));
+    memzero(pk_d_bytes, sizeof(pk_d_bytes));
+    memzero(raw_ua, sizeof(raw_ua));
+    memzero(data5, sizeof(data5));
+
     if(!ok) return 0;
-
-    // Sensitive data was cleared in the computation block above
-
     return (int)strlen(ua_out);
+}
+
+int orchard_derive_unified_address(
+    const uint8_t seed[64],
+    uint32_t coin_type,
+    uint32_t account,
+    const char* hrp,
+    char* ua_out,
+    size_t ua_out_len,
+    uint8_t* d_out,
+    uint8_t* pk_d_out) {
+    return derive_unified_address(
+        seed, coin_type, account, hrp, ua_out, ua_out_len, d_out, pk_d_out, false);
+}
+
+int orchard_derive_unified_address_legacy(
+    const uint8_t seed[64],
+    uint32_t coin_type,
+    uint32_t account,
+    const char* hrp,
+    char* ua_out,
+    size_t ua_out_len,
+    uint8_t* d_out,
+    uint8_t* pk_d_out) {
+    return derive_unified_address(
+        seed, coin_type, account, hrp, ua_out, ua_out_len, d_out, pk_d_out, true);
 }
 
 /* ---------------------------------------------------------------------- */

@@ -61,7 +61,7 @@ The library does **not** defend against power analysis (DPA/SPA), fault injectio
 
 All cryptographic functions stay within a **512-byte per-function** stack limit, verified by GCC `-fstack-usage`. Large intermediates (BLAKE2b state, bignum temporaries, curve points, the 564 B note plaintext + 580 B AEAD ciphertext scratch used by `orchard_compute_enc_ciphertext`) use `static` storage in BSS and are explicitly zeroed after use.
 
-The signer state machine is single-threaded per call on every supported MCU, so the `static` pattern does not introduce re-entrancy risks; cross-call leakage is prevented by per-function `memzero()` at every exit path.
+The signer state machine is single-threaded per call on every supported MCU, so the `static` pattern does not introduce re-entrancy risks. What is and is not wiped from that static storage is specified under [Secret material lifecycle](#secret-material-lifecycle).
 
 Build and verify:
 ```bash
@@ -73,7 +73,32 @@ cmake .. -DSTACK_ANALYSIS=ON && make
 
 1. **Derivation**: spending key derived from BIP39 seed via ZIP-32 (BLAKE2b-512).
 2. **Use**: signing via RedPallas (deterministic nonce from BLAKE2b-512).
-3. **Cleanup**: all intermediate scalars, points, hash states, and key bytes are zeroed via `memzero()` before function return. Static storage is wiped after each operation to prevent cross-call leakage.
+3. **Cleanup**: intermediate scalars, points, hash states and key bytes are zeroed via `memzero()` before the function that owns them returns.
+
+### What is guaranteed about static storage
+
+Static storage matters more than the stack here: on Flipper Zero an external app's `.data`/`.bss` is heap, and whatever is left in it survives the app.
+
+**Guarantee.** After any library function returns, no `static` object of the library holds data derived from the caller's secrets (PIN, PIN-derived key, mnemonic, seed, spending/viewing key components, signing nonces, note randomness), with the exceptions listed below. This covers derived state — hash message schedules, HMAC key pads, field and point temporaries — not only verbatim copies of a key.
+
+**How it is checked.** `tests/test_residue.c` (part of `ctest`) runs PIN KDF, seal + unseal, mnemonic → seed, ZIP-32 and BIP-32 derivation, `ak`, default address (current and legacy), RedPallas signing (plain and domain-separated), ECDSA signing, cmx + `enc_ciphertext` recomputation and HMAC/SHA-2 one-shots twice, with two unrelated sets of secrets, snapshots the whole `.data`/`.bss` of the process after each run and requires the two snapshots to be byte-identical. It also searches the snapshots for verbatim copies of each secret. It passes with gcc and clang, Debug and Release. On the release before this check existed it reports 4167 secret-dependent bytes in 143 ranges, among them the 64-byte PIN-derived wallet-seal key left verbatim by `pbkdf2_hmac_sha512()` (fixed), the SHA-256/SHA-512 message schedules, the secp256k1 ladder temporaries and the hash-to-curve / Sinsemilla intermediates (all fixed).
+
+**Limits of the check.** It covers the paths that sequence executes, on an ELF/Linux host (elsewhere the test reports SKIP). The signer and dispatcher state machines are not driven by it; their static buffers (`computed_enc`, the memo review scratch) were reviewed by hand and are wiped.
+
+**Exceptions — deliberately or knowingly not wiped:**
+
+| Object | Holds | Why |
+|---|---|---|
+| `orchard_diversify_hash()` cache (`cached_d`, `cached_g_d`) | the last diversifier processed and its `g_d` | Public address data, kept so one action hashes it once. It does identify the last address handled (possibly the wallet's own) |
+| `zip244_transparent_per_input_sighash()` (`s_ctx`, `s_digests`) | BLAKE2b state and sub-digests of the transaction being signed | Transaction data the host supplied |
+| `orchard_decode_ua_orchard_receiver()` (`hrp_decoded`, `data5`, `raw`) | the last recipient address decoded | Transaction data the host supplied |
+| `mnemonic_generate()` / `mnemonic_from_data()` (`mnemo`) | the generated mnemonic | It is the return value; the caller must call `mnemonic_clear()` when done |
+| BIP-39 cache, only with `USE_BIP39_CACHE=1` (default 0) | mnemonic, passphrase and seed | Opt-in cache; `bip39_cache_clear()` empties it |
+| Curve constants, init flags, callback pointers, the yield counter, the test-only LCG state | nothing secret | Configuration |
+
+**Caller-owned memory is the caller's to wipe**: output buffers, `HwpDispatcher` / signer contexts (which hold the session's keys by design), and streaming hash/HMAC contexts that are never finalized.
+
+**The stack is best effort.** Named stack buffers that hold secrets are `memzero()`ed, but C cannot control what a compiler spills or copies. `test_residue` also copies the dead stack right after the sequence and searches it for verbatim secrets; it finds none with gcc 16 and clang 23 on x86-64, but that result is reported for information only and is not part of the pass/fail verdict or of the guarantee.
 
 ## Test vector corpus
 
@@ -83,6 +108,8 @@ Known-answer tests in `tests/test_vectors.c` cross-check the C implementation ag
 - **Pallas hash-to-curve** (3 domain/message pairs including SinsemillaQ)
 - **Sinsemilla S-table** (5 sample points: indices 0, 1, 2, 512, 1023)
 - **ZIP-32** full derivation chain (master key, spending key, ak, nk, rivk, diversifier, pk_d)
+- **Default address vs the `orchard` crate** (`tests/test_address_vectors.h`, generated by `tools/gen_address_vectors` against `orchard` 0.16.0): 16 seed/network pairs (8 seeds × mainnet/testnet), 7 of them with an odd-y `[ask]·G`. For each: `ak`, default `d` and `pk_d` equal to `FullViewingKey::address_at(0, External)`, the UA string, and the pre-fix address returned by `orchard_derive_unified_address_legacy()` — equal to the default exactly when y is even. Before November 2026 the corpus had a single, even-y address vector, which is how a wrong diversifier key for odd-y seeds went unnoticed (see README, "Default address conformance")
+- **Secret residue** (`tests/test_residue.c`): see [What is guaranteed about static storage](#what-is-guaranteed-about-static-storage)
 - **ZIP-32 child key intermediates** (per-hop sk + chaincode for each of the 3 derivation steps)
 - **FF1-AES-256** diversifier encryption (3 synthetic + 1 real dk from ZIP-32 derivation)
 - **RedPallas signing** with deterministic nonce (4 test cases: standard, alpha=0, sighash=0, large scalars; compiled with `TEST_DETERMINISTIC_NONCE`)

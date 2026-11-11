@@ -12,3 +12,4 @@ compile_commands.json
 
 # Rust build artifacts (test vector generator)
 tools/gen_test_vectors/target/
+tools/gen_address_vectors/target/

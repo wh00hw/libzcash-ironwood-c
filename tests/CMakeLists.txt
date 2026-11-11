@@ -110,3 +110,10 @@ add_executable(test_curve test_curve.c)
 target_link_libraries(test_curve PRIVATE zcash-ironwood-c-deterministic)
 target_compile_options(test_curve PRIVATE -UNDEBUG)
 add_test(NAME test_curve COMMAND test_curve)
+
+# Secret residue in .data/.bss after a full wallet sequence (ELF/Linux;
+# reports SKIP elsewhere).
+add_executable(test_residue test_residue.c)
+target_link_libraries(test_residue PRIVATE zcash-ironwood-c-deterministic)
+target_include_directories(test_residue PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME test_residue COMMAND test_residue)

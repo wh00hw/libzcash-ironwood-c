@@ -555,7 +555,9 @@ int fp_is_square(const bignum256* a) {
     // Euler criterion: a^((p-1)/2) == 1
     static bignum256 r;
     fp_pow(&r, a, &s_pm1h);
-    return bn_is_one(&r);
+    int ok = bn_is_one(&r);
+    memzero(&r, sizeof(r));
+    return ok;
 }
 
 /* Square root mod p; returns 1 and a root in r if a is a square, else 0.
@@ -623,6 +625,7 @@ void fq_reduce(bignum256* r, const bignum256* a) {
         static bignum256 t;
         bn_subtract(r, &s_q, &t);
         bn_copy(&t, r);
+        memzero(&t, sizeof(t));
     }
 }
 
@@ -788,6 +791,7 @@ void pallas_jac_add_mixed(pallas_jac* r, const pallas_jac* j, const pallas_point
         static pallas_jac q;
         pallas_to_jac(&q, p);
         pallas_jac_add(r, j, &q);
+        memzero(&q, sizeof(q));
         return;
     }
 
@@ -1220,6 +1224,7 @@ static void map_to_curve_swu(const bignum256* u, bignum256* out_x, bignum256* ou
         fp_add(&tv2p1, &tv2, &tmp);
         fp_mul(&x1_num, &s_iso_b, &tv2p1);
         fp_neg(&x1_num, &x1_num);
+        memzero(&tv2p1, sizeof(tv2p1));
         // x1_den = A * tv2
         fp_mul(&x1_den, &s_iso_a, &tv2);
     }
@@ -1259,6 +1264,8 @@ static void map_to_curve_swu(const bignum256* u, bignum256* out_x, bignum256* ou
 
         fp_mul(&tmp, &gx2_num, &xd3);
         fp_sqrt(&y, &tmp);
+        memzero(&x2n2, sizeof(x2n2)); memzero(&x2n3, sizeof(x2n3));
+        memzero(&gx2_num, sizeof(gx2_num));
     }
 
     // Affine output: x = x_num / x1_den, y = y / x1_den^3 (one inversion).
@@ -1275,6 +1282,17 @@ static void map_to_curve_swu(const bignum256* u, bignum256* out_x, bignum256* ou
     if(u_sign != y_sign) {
         fp_neg(out_y, out_y);
     }
+
+    /* Statics (stack budget): the map's input is public at most call sites
+     * but not at all of them (Sinsemilla without the S table hashes message
+     * chunks), so nothing is left behind. */
+    memzero(&u2, sizeof(u2)); memzero(&tv1, sizeof(tv1)); memzero(&tv2, sizeof(tv2));
+    memzero(&y, sizeof(y)); memzero(&tmp, sizeof(tmp));
+    memzero(&x1_num, sizeof(x1_num)); memzero(&x1_den, sizeof(x1_den));
+    memzero(&xn2, sizeof(xn2)); memzero(&xn3, sizeof(xn3));
+    memzero(&xd2, sizeof(xd2)); memzero(&xd3, sizeof(xd3));
+    memzero(&gx1_num, sizeof(gx1_num)); memzero(&x_num, sizeof(x_num));
+    memzero(&inv, sizeof(inv));
 }
 
 // 3-isogeny map from iso-Pallas to Pallas
@@ -1331,6 +1349,10 @@ static void iso_map(const bignum256* ix, const bignum256* iy, bignum256* ox, big
     fp_inv(&inv, &yd);
     fp_mul(oy, &yn, &inv);
     fp_mul(oy, oy, iy);
+
+    memzero(&x2, sizeof(x2)); memzero(&x3, sizeof(x3)); memzero(&tmp, sizeof(tmp));
+    memzero(&xn, sizeof(xn)); memzero(&xd, sizeof(xd));
+    memzero(&yn, sizeof(yn)); memzero(&yd, sizeof(yd)); memzero(&inv, sizeof(inv));
 }
 
 // Full hash-to-curve for Pallas
@@ -1365,6 +1387,7 @@ static void hash_to_curve_compute(pallas_point* r, const char* domain, const uin
         blake2b_Update(&S, (const uint8_t*)curve_suffix, suf_len);
         blake2b_Update(&S, &dst_len_byte, 1);
         blake2b_Final(&S, b0, CHUNKLEN);
+        memzero(&S, sizeof(S));
     }
 
     // b_1 = BLAKE2b-64(personal=zeros, b_0 || I2OSP(1,1) || DST || len)
@@ -1378,6 +1401,7 @@ static void hash_to_curve_compute(pallas_point* r, const char* domain, const uin
         blake2b_Update(&S, (const uint8_t*)curve_suffix, suf_len);
         blake2b_Update(&S, &dst_len_byte, 1);
         blake2b_Final(&S, b1, CHUNKLEN);
+        memzero(&S, sizeof(S));
     }
 
     // b_2 = BLAKE2b-64(personal=zeros, (b_0 XOR b_1) || I2OSP(2,1) || DST || len)
@@ -1393,6 +1417,8 @@ static void hash_to_curve_compute(pallas_point* r, const char* domain, const uin
         blake2b_Update(&S, (const uint8_t*)curve_suffix, suf_len);
         blake2b_Update(&S, &dst_len_byte, 1);
         blake2b_Final(&S, b2, CHUNKLEN);
+        memzero(&S, sizeof(S));
+        memzero(xored, sizeof(xored));
     }
 
     // Hash to field: reverse each 64-byte block, then reduce mod p
@@ -1421,7 +1447,14 @@ static void hash_to_curve_compute(pallas_point* r, const char* domain, const uin
         fp_mul(&lo, &lo, &one);
         fp_mul(&hi, &hi, &two_256);
         fp_add(&u1, &lo, &hi);
+
+        memzero(rev, sizeof(rev));
+        memzero(&lo, sizeof(lo));
+        memzero(&hi, sizeof(hi));
     }
+    memzero(b0, sizeof(b0));
+    memzero(b1, sizeof(b1));
+    memzero(b2, sizeof(b2));
 
     // Map to iso-Pallas via SWU, apply isogeny, and add.
     // All large intermediates are static to avoid ~700 bytes stack pressure.
@@ -1442,7 +1475,16 @@ static void hash_to_curve_compute(pallas_point* r, const char* domain, const uin
         pallas_to_jac(&j0, &p0);
         pallas_jac_add_mixed(&jtmp, &j0, &p1);
         pallas_from_jac(r, &jtmp);
+
+        memzero(&ix0, sizeof(ix0)); memzero(&iy0, sizeof(iy0));
+        memzero(&ix1, sizeof(ix1)); memzero(&iy1, sizeof(iy1));
+        memzero(&px0, sizeof(px0)); memzero(&py0, sizeof(py0));
+        memzero(&px1, sizeof(px1)); memzero(&py1, sizeof(py1));
+        memzero(&p0, sizeof(p0)); memzero(&p1, sizeof(p1));
+        memzero(&j0, sizeof(j0)); memzero(&jtmp, sizeof(jtmp));
     }
+    memzero(&u0, sizeof(u0));
+    memzero(&u1, sizeof(u1));
 }
 
 static const pallas_fixed_point* fixed_point_find(const char* domain, const uint8_t* msg, size_t msg_len) {
@@ -1655,6 +1697,7 @@ void sinsemilla_hash_to_point(
                 bn_read_le(buf + 32, &S.y);
                 S.infinity = 0;
             }
+            memzero(buf, sizeof(buf));
         }
         if(!got) {
             // Slow fallback: compute on-the-fly
@@ -1673,9 +1716,15 @@ void sinsemilla_hash_to_point(
         static pallas_jac tmp;
         pallas_jac_double(&tmp, &acc);
         pallas_jac_add_mixed(&acc, &tmp, &S);
+
+        /* The table point is selected by the message chunk: not kept. */
+        memzero(&tmp, sizeof(tmp));
+        memzero(&S, sizeof(S));
+        chunk = 0;
     }
 
     pallas_from_jac(r, &acc);
+    memzero(&acc, sizeof(acc));
 }
 
 void sinsemilla_short_commit(
@@ -1706,6 +1755,7 @@ void sinsemilla_short_commit(
         static pallas_point R;
         pallas_hash_to_curve(&R, r_domain, (const uint8_t*)"", 0);
         pallas_point_mul(&rcm_R, rcm, &R);
+        memzero(&R, sizeof(R));
     }
 
     static pallas_jac j;
@@ -1718,4 +1768,12 @@ void sinsemilla_short_commit(
 
     // Extract x-coordinate
     bn_copy(&commit.x, r);
+
+    /* S is the un-blinded commitment and rcm_R the blinding term: either
+     * one next to the public commitment gives the other away. */
+    memzero(&S, sizeof(S));
+    memzero(&rcm_R, sizeof(rcm_R));
+    memzero(&j, sizeof(j));
+    memzero(&tmp, sizeof(tmp));
+    memzero(&commit, sizeof(commit));
 }

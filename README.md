@@ -12,6 +12,10 @@ Pure C11 library for Zcash Orchard/Ironwood + Transparent transactions on embedd
 
 Implements key derivation, address generation, RedPallas signing, ECDSA transparent signing, and a binary serial protocol (HWP) for host-device communication. Zero external dependencies — all cryptographic primitives are self-contained. No dynamic memory allocation, no OS calls, no hardware-specific code in the core.
 
+> **Upgrade note — default address (November 2026).** `orchard_derive_unified_address()` now returns the address every librustzcash-based wallet derives from the same full viewing key (`FullViewingKey::address_at(0, External)` in the `orchard` crate). Earlier releases (up to a55d168) computed the diversifier key from the un-normalised `[ask]·G` encoding and, for seeds whose `[ask]·G` has an odd y-coordinate — about half of all seeds — returned a different default address. Keys, FVK, signatures and every other output are unchanged; seeds with an even y are not affected at all.
+>
+> If a wallet is affected, the address it showed before is **still its own**: an external address of the same incoming viewing key, so funds sent to it — past or future — are detected and spendable by the device and by any wallet holding the FVK. Only the *default* address differs. `orchard_derive_unified_address_legacy()` returns the pre-fix address; compare it with the current one to tell whether a seed is affected (see [Default address conformance](#default-address-conformance)).
+
 ## Features
 
 - **ZIP-32 key derivation** — master key from BIP39 seed, hardened child derivation (`m_Orchard / 32' / coin_type' / account'`)
@@ -224,6 +228,22 @@ int len = orchard_derive_unified_address(
     bip39_seed, 133, 0, "u", ua, sizeof(ua), NULL, NULL);
 ```
 
+#### Default address conformance
+
+The default address is the external address at diversifier index 0 of the account's full viewing key. The diversifier key is `dk = PRF^expand_rivk([0x82] ‖ ak ‖ nk)[..32]` (protocol spec §4.2.3), where `ak` is the spend validating key as encoded in the FVK — always with sign bit 0, because the spec negates `ask` when `[ask]·G` has an odd y. Releases up to a55d168 used the sign of the un-normalised point there, which changed `dk`, hence the default diversifier, for odd-y seeds. `ivk` (which only uses the x-coordinate), `ak`, `nk`, `rivk` and the signing path were always correct, so both the old and the new address belong to the same wallet.
+
+To find out whether an upgrade changes the address a wallet has been showing:
+
+```c
+uint8_t d_new[11], pk_new[32], d_old[11], pk_old[32];
+char ua_new[256], ua_old[256];
+orchard_derive_unified_address(seed, coin, 0, hrp, ua_new, sizeof(ua_new), d_new, pk_new);
+orchard_derive_unified_address_legacy(seed, coin, 0, hrp, ua_old, sizeof(ua_old), d_old, pk_old);
+bool affected = strcmp(ua_new, ua_old) != 0;   // or compare ua_old with a stored address
+```
+
+Firmware that stored the address it displayed can equally compare the stored string with `ua_new`. An affected wallet should show the new address from now on (it is the one host wallets expect) and may keep listing `ua_old` as a previously used address; nothing needs to be moved. `tests/test_address_vectors.h` holds 16 seed/network vectors generated from `orchard` 0.16.0, seven of them odd-y, with both addresses.
+
 ### RedPallas signing (Orchard)
 
 ```c
@@ -311,6 +331,7 @@ src/
 tools/
   gen_test_vectors/     — Rust generator for the Orchard KAT corpus (vs librustzcash)
   gen_ironwood_vectors/ — Rust generator for the NU6.3 / Ironwood vectors
+  gen_address_vectors/  — Rust generator for tests/test_address_vectors.h (default address vs orchard 0.16.0, even- and odd-y seeds)
   gen_sqrt_table.py     — Generator for src/pallas_sqrt_table.h
   gen_fixed_base_table.py — Generator for src/pallas_fixed_base_table.h
   bench_pallas.c        — Host micro-benchmark for the Pallas hot path (built as tests/bench_pallas)
@@ -648,6 +669,7 @@ The GLV constants and the choice of techniques follow the Zakura engineering not
 - **Constant-time modular reduction** — `fq_full_reduce()` uses fixed-iteration conditional subtraction via `bn_cmov()`; no variable-length while loops
 - **Constant-time field multiplication** — `fq_mul()` uses `bn_cmov()` for conditional add; no branching on secret bits
 - **Constant-time nonce handling** — nonce == 0 check uses `bn_cmov()` instead of `if` branch
+- **No secret residue in static storage** — every `static` scratch buffer that holds key-derived data is wiped before its function returns; `tests/test_residue.c` runs a seal → derive → sign → verify sequence with two different sets of secrets and fails if any byte of `.data`/`.bss` differs afterwards. The exact guarantee and its exceptions are in [SECURITY.md](SECURITY.md#secret-material-lifecycle)
 - **Full secret cleanup** — all intermediate scalars, points, and key material are explicitly zeroed via `memzero()` after use (including hash states, intermediate bignums, and point structures)
 - **Embedded-safe memory layout** — large cryptographic intermediates use `static` storage (BSS) to stay within 4 KB stack constraints (e.g. Flipper Zero); all are explicitly wiped after each operation
 - **`ct_memequal()`** — constant-time memory comparison utility available for application use

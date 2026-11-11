@@ -118,6 +118,7 @@ void pbkdf2_hmac_sha256(
         } else {
             memcpy(key + key_offset, digest, last_block_size);
         }
+        memzero(digest, sizeof(digest));
     }
 }
 
@@ -215,5 +216,9 @@ void pbkdf2_hmac_sha512(
         } else {
             memcpy(key + key_offset, digest, last_block_size);
         }
+        /* `digest` is the derived key block and it is static: without this
+         * the caller's key (e.g. the PIN-derived wallet-seal key) stays in
+         * .bss after the caller has wiped its own copy. */
+        memzero(digest, sizeof(digest));
     }
 }

@@ -482,8 +482,11 @@ void sha1_Transform(const sha2_word32* state_in, const sha2_word32* data, sha2_w
     state_out[3] = state_in[3] + d;
     state_out[4] = state_in[4] + e;
 
-    /* Clean up */
+    /* Clean up. These are statics (stack budget), so the block's message
+     * schedule and working variables would otherwise outlive the call —
+     * for HMAC/PBKDF2 they are derived from the key. */
     a = b = c = d = e = T1 = 0;
+    memzero(W1, sizeof(W1));
 }
 
 #endif /* SHA2_UNROLL_TRANSFORM */
@@ -808,8 +811,11 @@ void sha256_Transform(const sha2_word32* state_in, const sha2_word32* data, sha2
     state_out[6] = state_in[6] + g;
     state_out[7] = state_in[7] + h;
 
-    /* Clean up */
-    a = b = c = d = e = f = g = h = T1 = T2 = 0;
+    /* Clean up. These are statics (stack budget), so the block's message
+     * schedule and working variables would otherwise outlive the call —
+     * for HMAC/PBKDF2 they are derived from the key. */
+    a = b = c = d = e = f = g = h = s0 = s1 = T1 = T2 = 0;
+    memzero(W256, sizeof(W256));
 }
 
 #endif /* SHA2_UNROLL_TRANSFORM */
@@ -1122,8 +1128,11 @@ void sha512_Transform(const sha2_word64* state_in, const sha2_word64* data, sha2
     state_out[6] = state_in[6] + g;
     state_out[7] = state_in[7] + h;
 
-    /* Clean up */
-    a = b = c = d = e = f = g = h = T1 = T2 = 0;
+    /* Clean up. These are statics (stack budget), so the block's message
+     * schedule and working variables would otherwise outlive the call —
+     * for HMAC/PBKDF2 they are derived from the key. */
+    a = b = c = d = e = f = g = h = s0 = s1 = T1 = T2 = 0;
+    memzero(W512, sizeof(W512));
 }
 
 #endif /* SHA2_UNROLL_TRANSFORM */

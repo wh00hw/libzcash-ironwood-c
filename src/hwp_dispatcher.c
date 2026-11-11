@@ -231,8 +231,11 @@ static HWP_NOINLINE bool run_per_output_review(HwpDispatcher* d) {
                 HwpUiResult rm = d->ui.review_memo(
                     (uint16_t)(n_t + i + 1), total,
                     addr_buf, memo_buf, d->user_ctx);
+                memzero(memo_buf, sizeof(memo_buf));
                 if(rm != HWP_UI_OK) return false;
             }
+            /* static scratch: do not keep the memo plaintext past the review */
+            memzero(memo_buf, sizeof(memo_buf));
         }
 
         if(orchard_signer_confirm_action(d->signer, i) != SIGNER_OK) {

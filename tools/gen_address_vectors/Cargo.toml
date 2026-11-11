@@ -1,0 +1,19 @@
+[package]
+name = "gen_address_vectors"
+version = "0.1.0"
+edition = "2021"
+
+# Default-address known-answer vectors (tests/test_address_vectors.h).
+# The reference is the `orchard` crate; everything else here only serves to
+# classify each seed (parity of [ask]G) and to reproduce the pre-fix
+# ("legacy") address, and is cross-checked against the crate at run time.
+[dependencies]
+orchard = { version = "=0.16.0", default-features = false, features = ["std"] }
+zip32 = "0.3"
+pasta_curves = "0.6"
+group = "0.14"
+ff = "0.14"
+blake2b_simd = "1"
+fpe = { version = "0.7", default-features = false, features = ["alloc"] }
+aes = "0.9"
+hex = "0.4"

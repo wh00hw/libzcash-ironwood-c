@@ -13,6 +13,7 @@
 #include "bip39.h"
 #include "memzero.h"
 #include "test_vectors.h"
+#include "test_address_vectors.h"
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
@@ -487,6 +488,72 @@ static void test_orchard_encode_ua_raw(void) {
     passed_tests++;
 }
 
+/* ── Default address vs the orchard crate (tests/test_address_vectors.h) ── */
+
+static void check_true(const char* name, int cond) {
+    total_tests++;
+    if (cond) {
+        passed_tests++;
+        printf("  PASS: %s\n", name);
+    } else {
+        printf("  FAIL: %s\n", name);
+    }
+}
+
+/* Sixteen (seed, network) pairs, seven of them with an odd-y [ask]G — the
+ * case in which releases up to a55d168 derived the diversifier key from the
+ * un-normalised ak encoding and returned an address no FVK-based wallet
+ * would show. For each: ak and the default (d, pk_d) must equal the crate's,
+ * the legacy entry point must reproduce the pre-fix address, and the two
+ * must differ exactly when [ask]G is odd. */
+static void test_default_address_vectors(void) {
+    printf("\nDefault address (orchard 0.16.0, even and odd [ask]G):\n");
+
+    int odd_seen = 0;
+    for (int i = 0; i < ADDRESS_VECTORS_COUNT; i++) {
+        const address_vector* v = &ADDRESS_VECTORS[i];
+        const char* hrp = (v->coin_type == 133) ? "u" : "utest";
+        char label[96];
+
+        uint8_t sk[32], ask[32], nk[32], rivk[32], ak[32];
+        orchard_derive_account_sk(v->seed, v->coin_type, 0, sk);
+        orchard_derive_keys(sk, ask, nk, rivk);
+        redpallas_derive_ak(ask, ak);
+        snprintf(label, sizeof(label), "%s: ak", v->name);
+        assert_eq_bytes(label, v->ak, ak, 32);
+
+        uint8_t d[11], pk_d[32];
+        char ua[256] = {0}, ua_ref[256] = {0};
+        int len = orchard_derive_unified_address(
+            v->seed, v->coin_type, 0, hrp, ua, sizeof(ua), d, pk_d);
+        snprintf(label, sizeof(label), "%s: d%s", v->name, v->ak_odd ? " (odd y)" : "");
+        assert_eq_bytes(label, v->d, d, 11);
+        snprintf(label, sizeof(label), "%s: pk_d", v->name);
+        assert_eq_bytes(label, v->pk_d, pk_d, 32);
+        int ref_len = orchard_encode_ua_raw(v->d, v->pk_d, hrp, ua_ref, sizeof(ua_ref));
+        snprintf(label, sizeof(label), "%s: UA string", v->name);
+        check_true(label, len > 0 && len == ref_len && strcmp(ua, ua_ref) == 0);
+
+        uint8_t ld[11], lpk_d[32];
+        char lua[256] = {0};
+        int llen = orchard_derive_unified_address_legacy(
+            v->seed, v->coin_type, 0, hrp, lua, sizeof(lua), ld, lpk_d);
+        snprintf(label, sizeof(label), "%s: legacy d", v->name);
+        assert_eq_bytes(label, v->legacy_d, ld, 11);
+        snprintf(label, sizeof(label), "%s: legacy pk_d", v->name);
+        assert_eq_bytes(label, v->legacy_pk_d, lpk_d, 32);
+        int same = llen == len && strcmp(lua, ua) == 0 && memcmp(ld, d, 11) == 0 &&
+                   memcmp(lpk_d, pk_d, 32) == 0;
+        snprintf(label, sizeof(label), "%s: legacy %s current", v->name,
+                 v->ak_odd ? "!=" : "==");
+        check_true(label, llen > 0 && same == !v->ak_odd);
+        odd_seen += v->ak_odd;
+    }
+    check_true("vector set covers both parities",
+               odd_seen == ADDRESS_VECTORS_ODD_COUNT && odd_seen >= 4 &&
+               ADDRESS_VECTORS_COUNT - odd_seen >= 4);
+}
+
 /* ── Main ── */
 
 int main(void) {
@@ -507,6 +574,7 @@ int main(void) {
     test_f4jumble_inverse();
     test_orchard_note_commit();
     test_orchard_encode_ua_raw();
+    test_default_address_vectors();
 
     printf("\n=== Results: %d/%d tests passed ===\n", passed_tests, total_tests);
 

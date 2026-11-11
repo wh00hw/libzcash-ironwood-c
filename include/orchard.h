@@ -51,7 +51,40 @@ void orchard_derive_account_sk(
 // ua_out must be at least 256 bytes
 // d_out (optional, 11 bytes) and pk_d_out (optional, 32 bytes) for caching
 // Returns string length, or 0 on error
+//
+// This is the external address at diversifier index 0 of the account's full
+// viewing key, the one the `orchard` crate returns from
+// FullViewingKey::address_at(0, Scope::External) and that librustzcash-based
+// wallets show as the default address.
+//
+// BEHAVIOUR CHANGE (November 2026): earlier releases derived the diversifier
+// key from the un-normalised [ask]G encoding and returned a different
+// address for seeds whose [ask]G has an odd y-coordinate (about half of all
+// seeds). See orchard_derive_unified_address_legacy().
 int orchard_derive_unified_address(
+    const uint8_t seed[64],
+    uint32_t coin_type,
+    uint32_t account,
+    const char* hrp,
+    char* ua_out,
+    size_t ua_out_len,
+    uint8_t* d_out,
+    uint8_t* pk_d_out);
+
+// The default address as releases up to a55d168 derived it. Same parameters
+// and return value as orchard_derive_unified_address().
+//
+// For a seed whose [ask]G has an even y the result is identical to
+// orchard_derive_unified_address(). For the others it is the address those
+// releases displayed: still an external address of the same incoming
+// viewing key (at a diversifier index nobody would enumerate), so funds sent
+// to it are detected and spendable by any wallet holding the FVK.
+//
+// Use it to tell whether an upgrade changes a wallet's default address
+// (compare d_out / pk_d_out of the two functions, or the strings) and to
+// keep showing the previously published address. Do not use it for new
+// wallets.
+int orchard_derive_unified_address_legacy(
     const uint8_t seed[64],
     uint32_t coin_type,
     uint32_t account,
