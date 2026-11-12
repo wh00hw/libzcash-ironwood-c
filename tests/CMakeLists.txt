@@ -94,6 +94,7 @@ add_test(NAME test_base58 COMMAND test_base58)
 
 add_executable(test_hwp_dispatcher test_hwp_dispatcher.c)
 target_link_libraries(test_hwp_dispatcher PRIVATE zcash-ironwood-c-deterministic)
+target_include_directories(test_hwp_dispatcher PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 add_test(NAME test_hwp_dispatcher COMMAND test_hwp_dispatcher)
 
 # Host micro-benchmark for the Pallas hot path (not a ctest; run manually:
@@ -111,9 +112,78 @@ target_link_libraries(test_curve PRIVATE zcash-ironwood-c-deterministic)
 target_compile_options(test_curve PRIVATE -UNDEBUG)
 add_test(NAME test_curve COMMAND test_curve)
 
+# Known answers for the transparent key path (secp256k1 k*G, BIP-32, the
+# Zcash BIP-44 key). Built twice: against the library as shipped (ECDSA
+# signing compiled out), and from the sources with
+# ZCASH_ENABLE_TRANSPARENT_SIGNING=1 so that the switched-off code keeps
+# compiling and keeps giving the RFC 6979 answers.
+add_executable(test_secp256k1 test_secp256k1.c)
+target_link_libraries(test_secp256k1 PRIVATE zcash-ironwood-c-deterministic)
+add_test(NAME test_secp256k1 COMMAND test_secp256k1)
+
+add_executable(test_secp256k1_signing test_secp256k1.c
+    ${CMAKE_SOURCE_DIR}/src/secp256k1.c
+    ${CMAKE_SOURCE_DIR}/src/bip32.c
+    ${CMAKE_SOURCE_DIR}/src/bignum.c
+    ${CMAKE_SOURCE_DIR}/src/bip39.c
+    ${CMAKE_SOURCE_DIR}/src/bip39_english.c
+    ${CMAKE_SOURCE_DIR}/src/hmac.c
+    ${CMAKE_SOURCE_DIR}/src/pbkdf2.c
+    ${CMAKE_SOURCE_DIR}/src/sha2.c
+    ${CMAKE_SOURCE_DIR}/src/memzero.c
+    ${CMAKE_SOURCE_DIR}/src/rand.c
+    ${CMAKE_SOURCE_DIR}/src/hash_stubs.c
+)
+target_include_directories(test_secp256k1_signing PRIVATE
+    ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
+target_compile_definitions(test_secp256k1_signing PRIVATE
+    ZCASH_ENABLE_TRANSPARENT_SIGNING=1 USE_PLATFORM_RNG=0 ZORCHARD_INSECURE_LCG=1)
+add_test(NAME test_secp256k1_signing COMMAND test_secp256k1_signing)
+
 # Secret residue in .data/.bss after a full wallet sequence (ELF/Linux;
 # reports SKIP elsewhere).
 add_executable(test_residue test_residue.c)
 target_link_libraries(test_residue PRIVATE zcash-ironwood-c-deterministic)
 target_include_directories(test_residue PRIVATE ${CMAKE_SOURCE_DIR}/src)
 add_test(NAME test_residue COMMAND test_residue)
+
+# On-device ownership classification, mandatory ciphertext verification and
+# the consensus-branch allow-list, driven through the real signer state
+# machine with real actions (tests/test_tx_fixture.h).
+add_executable(test_ownership test_ownership.c)
+target_link_libraries(test_ownership PRIVATE zcash-ironwood-c-deterministic)
+target_include_directories(test_ownership PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+add_test(NAME test_ownership COMMAND test_ownership)
+
+# The same library and tests with FlipZcash's RAM tuning (application.fam
+# cdefines). The capacity macros shape struct layouts, so they must reach
+# the library objects and the test alike. This is the configuration in
+# which the memo pool is smaller than the action table, and where the
+# firmware's sizeof budgets are asserted.
+set(FLIPZ_TUNING_DEFS
+    ORCHARD_SIGNER_MAX_ACTIONS=8
+    ORCHARD_SIGNER_MAX_MEMOS=4
+    HWP_MAX_PAYLOAD=1536
+    FLIPZ_TUNING
+)
+get_target_property(DETERMINISTIC_SOURCES zcash-ironwood-c-deterministic SOURCES)
+add_library(zcash-ironwood-c-flipz STATIC ${DETERMINISTIC_SOURCES})
+target_include_directories(zcash-ironwood-c-flipz
+    PUBLIC ${CMAKE_SOURCE_DIR}/include
+    PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/aes
+)
+target_compile_definitions(zcash-ironwood-c-flipz
+    PRIVATE TEST_DETERMINISTIC_NONCE USE_PLATFORM_RNG=0 ZORCHARD_INSECURE_LCG=1
+    PUBLIC ${FLIPZ_TUNING_DEFS}
+)
+target_compile_options(zcash-ironwood-c-flipz PRIVATE -UNDEBUG -Wall -Wextra -Wno-unused-parameter)
+
+add_executable(test_ownership_flipz test_ownership.c)
+target_link_libraries(test_ownership_flipz PRIVATE zcash-ironwood-c-flipz)
+target_include_directories(test_ownership_flipz PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+add_test(NAME test_ownership_flipz COMMAND test_ownership_flipz)
+
+add_executable(test_hwp_dispatcher_flipz test_hwp_dispatcher.c)
+target_link_libraries(test_hwp_dispatcher_flipz PRIVATE zcash-ironwood-c-flipz)
+target_include_directories(test_hwp_dispatcher_flipz PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+add_test(NAME test_hwp_dispatcher_flipz COMMAND test_hwp_dispatcher_flipz)

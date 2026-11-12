@@ -2,7 +2,8 @@
  *
  * Times the primitives that dominate per-action verification on the device
  * (field mul/inv/sqrt, hash-to-curve, scalar multiplication, Sinsemilla,
- * cmx and enc_ciphertext recomputation) and the signing side (RedPallas
+ * cmx and enc_ciphertext recomputation, ownership classification against
+ * the wallet's incoming viewing keys) and the signing side (RedPallas
  * spend authorization, ak and address derivation). Host numbers are only meaningful
  * as ratios between two builds of the library; absolute device timings
  * need the same loop driven from the target's tick source.
@@ -115,6 +116,54 @@ int main(int argc, char** argv) {
         orchard_compute_enc_ciphertext_from_rseed(
             d, pk_d, 12345, rseed, rho, memo, ORCHARD_NOTE_V3, enc, epk);
     });
+
+    /* On-device ownership classification (orchard_signer.c): two Commit^ivk
+     * per signing session, then per output one [ivk]·g_d for an output that
+     * is the wallet's change (internal key tried first) and two for any
+     * other output. g_d comes from the diversifier cache that the cmx
+     * recomputation of the same output has just filled, as in the signer. */
+    {
+        uint8_t fvk_ak[32], fvk_nk[32], fvk_rivk[32], ivk_e[32], ivk_i[32];
+        uint8_t own_pk[32];
+        memcpy(fvk_ak, a_le, 32);
+        memcpy(fvk_nk, b_le, 32);
+        memset(fvk_rivk, 0x21, 32);
+        BENCH("orchard_derive_ivks (per session)", 2000,
+              (fvk_rivk[0]++, orchard_derive_ivks(fvk_ak, fvk_nk, fvk_rivk, ivk_e, ivk_i)));
+        orchard_ivk_derive_pk_d(ivk_i, d, own_pk);
+        int hits = 0;
+        BENCH("ownership check, 1 key (g_d cached)", 2000,
+              (hits += orchard_ivk_owns_address(ivk_i, d, own_pk)));
+        BENCH("classify: own change (1 check)", 2000,
+              (hits += orchard_ivk_owns_address(ivk_i, d, own_pk) ||
+                       orchard_ivk_owns_address(ivk_e, d, own_pk)));
+        BENCH("classify: external (2 checks)", 2000,
+              (hits += orchard_ivk_owns_address(ivk_i, d, pk_d) ||
+                       orchard_ivk_owns_address(ivk_e, d, pk_d)));
+        BENCH("per-action: cmx+enc+classify own", 2000, {
+            rseed[0]++;
+            orchard_compute_cmx(d, own_pk, 12345, rho, rseed, ORCHARD_NOTE_V3, cmx);
+            orchard_compute_enc_ciphertext_from_rseed(
+                d, own_pk, 12345, rseed, rho, memo, ORCHARD_NOTE_V3, enc, epk);
+            hits += orchard_ivk_owns_address(ivk_i, d, own_pk) ||
+                    orchard_ivk_owns_address(ivk_e, d, own_pk);
+        });
+        BENCH("per-action: cmx+enc+classify ext", 2000, {
+            rseed[0]++;
+            orchard_compute_cmx(d, pk_d, 12345, rho, rseed, ORCHARD_NOTE_V3, cmx);
+            orchard_compute_enc_ciphertext_from_rseed(
+                d, pk_d, 12345, rseed, rho, memo, ORCHARD_NOTE_V3, enc, epk);
+            hits += orchard_ivk_owns_address(ivk_i, d, pk_d) ||
+                    orchard_ivk_owns_address(ivk_e, d, pk_d);
+        });
+        BENCH("padding: cmx+classify (compact)", 2000, {
+            rseed[0]++;
+            orchard_compute_cmx(d, pk_d, 0, rho, rseed, ORCHARD_NOTE_V3, cmx);
+            hits += orchard_ivk_owns_address(ivk_i, d, pk_d) ||
+                    orchard_ivk_owns_address(ivk_e, d, pk_d);
+        });
+        cmx[0] ^= (uint8_t)hits;
+    }
 
     /* Signing side. ask/alpha are arbitrary scalars below q. */
     uint8_t ask[32], alpha[32], sighash[32], sig[64], rk[32], ak[32];

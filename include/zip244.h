@@ -49,6 +49,17 @@ typedef enum {
  * Transaction header metadata needed for sighash computation.
  * Sent from companion to device before action data.
  *
+ * NOT every field here is bound by the sighash. SECURITY.md, "What binds
+ * each host-supplied field", has the full table; in short:
+ *   - flags and value_balance of a pool are hashed ONLY if that pool has at
+ *     least one action. For a pool without actions the bundle does not
+ *     exist on chain and zip244_shielded_sighash_v6() hashes the empty-
+ *     bundle constant — it does not read the pool's fields. A caller that
+ *     uses value_balance for anything (a fee) must therefore require it to
+ *     be zero for such a pool; orchard_signer does.
+ *   - anchors are not in the v6 effects digest at all.
+ *   - coin_type is not part of the transaction.
+ *
  * Wire format (v6, 166 bytes — the ONLY layout this library accepts;
  * legacy 125/129-byte v5 metas are rejected by zip244_parse_tx_meta):
  *   version[4 LE] || version_group_id[4 LE] || consensus_branch_id[4 LE] ||
@@ -93,12 +104,14 @@ typedef struct {
     uint8_t  ironwood_flags;
     /** Ironwood bundle net value balance (zatoshis, signed). */
     int64_t  ironwood_value_balance;
-    /** Ironwood bundle anchor. Carried for display/consistency only — under
-     *  the v6 format anchors are NOT part of the effects digest. */
+    /** Ironwood bundle anchor. Like `anchor`, not read by this library:
+     *  under the v6 format anchors are NOT part of the effects digest. */
     uint8_t  ironwood_anchor[32];
     uint8_t  transparent_sig_digest[32];
     uint8_t  sapling_digest[32];
-    /** ZIP-32 coin type: 133 = mainnet, 1 = testnet, 0 = unspecified. */
+    /** ZIP-32 coin type the host declares: 133 = mainnet, 1 = testnet,
+     *  0 = not sent (166-byte layout). Not part of the transaction; the
+     *  signer compares it with the device's own network. */
     uint32_t coin_type;
 } Zip244TxMeta;
 
@@ -130,107 +143,69 @@ typedef struct {
 /* ------------------------------------------------------------------ */
 
 /**
- * Incremental state for computing the ZIP-244 transparent txid digest.
+ * Incremental state for the ZIP-244 transparent digest of a transaction
+ * with NO TRANSPARENT INPUTS (shielded -> transparent payments).
  *
- * Three parallel BLAKE2b contexts hash different portions of each input/output:
- * - prevouts:  prevout_hash[32] || prevout_index[4 LE] per input
- * - sequences: sequence[4 LE] per input
- * - outputs:   value[8 LE] || CompactSize(script_len) || script_pubkey per output
+ * TRANSPARENT INPUTS ARE NOT SUPPORTED. With an empty vin, ZIP 244 defines
+ * the transparent leaf of the signature hash (S.2) to be the txid digest
+ * (T.2):
  *
- * The combined digest is:
  *   BLAKE2b-256("ZTxIdTranspaHash",
  *       prevouts_digest || sequence_digest || outputs_digest)
+ *
+ * where prevouts_digest and sequence_digest are the hashes of nothing under
+ * their personalizations, and the whole leaf is BLAKE2b-256(
+ * "ZTxIdTranspaHash", "") when there are no outputs either. That is the only
+ * case this state computes. With a non-empty vin the leaf is a different
+ * construction (hash_type, amounts, scripts, per-input data) that this
+ * library does not implement — earlier revisions hashed inputs into the T.2
+ * form, which gives a sighash the network rejects; see README, "Transparent
+ * inputs are not supported".
  */
 typedef struct {
-    blake2b_state prevouts_ctx;    /* "ZTxIdPrevoutHash" */
-    blake2b_state sequence_ctx;    /* "ZTxIdSequencHash" */
     blake2b_state outputs_ctx;     /* "ZTxIdOutputsHash" */
-    blake2b_state amounts_ctx;     /* "ZTxTrAmountsHash" (per-input sighash) */
-    blake2b_state scripts_ctx;     /* "ZTxTrScriptsHash" (per-input sighash) */
-    uint16_t inputs_received;
     uint16_t outputs_received;
-    /* Per-input/output value running totals (zatoshis), independent of the
-     * BLAKE2b digests. Used by the orchard signer to compute the on-device
-     * fee = t_in_total - t_out_total + value_balance, so the user can be
-     * asked to confirm the fee value itself (closes the "companion-claimed
-     * fee != real fee" gap — a hostile companion could inflate value_balance
-     * and pay extra to miners while showing a small fee in its own UI). */
-    uint64_t t_in_total;
+    /* Running total of the output values (zatoshis), for the on-device fee
+     * and "total leaving" computation. */
     uint64_t t_out_total;
-    bool t_in_overflow;            /* set if any add overflowed */
-    bool t_out_overflow;
+    bool t_out_overflow;           /* set if the sum overflowed uint64 */
     bool initialized;
 } Zip244TransparentState;
 
 /**
  * Initialize the incremental transparent digest state.
- * Must be called before any zip244_hash_transparent_input/output() calls.
+ * Must be called before any zip244_hash_transparent_output() call.
  */
 void zip244_transparent_init(Zip244TransparentState *state);
 
-/**
- * Hash one transparent input incrementally.
- *
- * Wire format (from companion SDK):
- *   prevout_hash[32] || prevout_index[4 LE] || sequence[4 LE] ||
- *   value[8 LE] || script_pubkey_len[2 LE] || script_pubkey[N]
- *
- * Extracts prevout + sequence and feeds them into the respective hashers.
- * Returns true on success, false if data_len < 48 (minimum: 32+4+4+8).
- */
-bool zip244_hash_transparent_input(Zip244TransparentState *state,
-                                   const uint8_t *data, size_t data_len);
+/* zip244_hash_transparent_input() was removed together with transparent-
+ * input support (it also read two bytes past a 48-byte input). */
 
 /**
  * Hash one transparent output incrementally.
  *
- * Wire format (from companion SDK):
+ * Wire format (from companion SDK), exact length required:
  *   value[8 LE] || script_pubkey_len[2 LE] || script_pubkey[N]
  *
  * Re-encodes with CompactSize for the script length before hashing,
  * matching the serialization used by zcash_primitives::TxOut::write().
- * Returns true on success, false if data_len < 10.
+ * Returns true on success, false if data_len != 10 + script_pubkey_len.
  */
 bool zip244_hash_transparent_output(Zip244TransparentState *state,
                                     const uint8_t *data, size_t data_len);
 
 /**
- * Finalize and compute the transparent txid digest.
- *
- * transparent_digest = BLAKE2b-256("ZTxIdTranspaHash",
- *     prevouts_digest || sequence_digest || outputs_digest)
- *
- * digest_out must be 32 bytes.
+ * Finalize and compute the transparent leaf for a transaction without
+ * transparent inputs (see Zip244TransparentState): the empty-bundle
+ * constant if no output was hashed, the T.2 digest otherwise.
+ * Consumes the state's hash context. digest_out must be 32 bytes.
  */
 void zip244_transparent_digest(Zip244TransparentState *state,
                                uint8_t digest_out[32]);
 
-/**
- * Compute the per-input transparent signature digest (ZIP-244 S.2).
- *
- * For SIGHASH_ALL (the standard case):
- *   BLAKE2b-256("ZTxIdTranspaHash",
- *       hash_type[1] || prevouts_digest || amounts_digest || scripts_digest ||
- *       sequence_digest || outputs_digest || txin_sig_digest)
- *
- * Where txin_sig_digest = BLAKE2b-256("Zcash___TxInHash",
- *       prevout_hash[32] || prevout_index[4 LE] || value[8 LE signed] ||
- *       CompactSize(script_len) || script_pubkey || sequence[4 LE])
- *
- * @param state         Transparent state (must have all inputs/outputs hashed)
- * @param input_index   Index of the input being signed
- * @param inputs        Array of all transparent inputs (for txin_sig_digest)
- * @param num_inputs    Number of inputs
- * @param hash_type     Sighash type (usually 0x01 = SIGHASH_ALL)
- * @param sighash_out   32-byte output
- */
-void zip244_transparent_per_input_sighash(
-    Zip244TransparentState *state,
-    uint16_t input_index,
-    const uint8_t *input_data,  /* raw wire data of the specific input being signed */
-    size_t input_data_len,
-    uint8_t hash_type,
-    uint8_t sighash_out[32]);
+/* zip244_transparent_per_input_sighash() was removed: it returned the S.2
+ * transparent node, not the transaction's signature hash, so an ECDSA
+ * signature over it was not valid on chain. */
 
 /* ------------------------------------------------------------------ */
 
@@ -342,7 +317,9 @@ void zip244_header_digest(const Zip244TxMeta* meta, uint8_t digest_out[32]);
  *     orchard_digest || ironwood_digest)
  *
  * A pool state with zero hashed actions (or a NULL state pointer)
- * contributes the pool's empty-bundle digest; otherwise the state must have
+ * contributes the pool's empty-bundle digest, and that pool's flags and
+ * value_balance in `meta` are then NOT hashed (the caller must not rely on
+ * them: see Zip244TxMeta). Otherwise the state must have
  * been initialized with zip244_actions_init_pool() for the matching pool
  * with v6 == true, and its bundle digest is computed from the pool's
  * flags/value_balance in `meta` (anchors are NOT hashed under v6).

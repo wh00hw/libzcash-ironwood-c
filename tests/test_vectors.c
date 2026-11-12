@@ -554,6 +554,127 @@ static void test_default_address_vectors(void) {
                ADDRESS_VECTORS_COUNT - odd_seen >= 4);
 }
 
+/* ── Viewing keys and address ownership vs the orchard crate ──
+ *
+ * What the signer uses to tell the wallet's own outputs from anyone else's:
+ * rivk_internal, Commit^ivk for both scopes, and pk_d == [ivk]·DiversifyHash(d).
+ * Vectors: tests/test_address_vectors.h (orchard 0.16.0), 8 seeds × 2
+ * networks, 7 of the 16 with an odd-y [ask]G. */
+static void test_viewing_key_vectors(void) {
+    printf("\nViewing keys and ownership (orchard 0.16.0, both scopes):\n");
+
+    for (int i = 0; i < ADDRESS_VECTORS_COUNT; i++) {
+        const address_vector* v = &ADDRESS_VECTORS[i];
+        const address_vector* other = &ADDRESS_VECTORS[(i + 2) % ADDRESS_VECTORS_COUNT];
+        char label[112];
+
+        /* The FVK as the device holds it, derived from the seed. */
+        uint8_t sk[32], ask[32], nk[32], rivk[32], ak[32];
+        orchard_derive_account_sk(v->seed, v->coin_type, 0, sk);
+        orchard_derive_keys(sk, ask, nk, rivk);
+        redpallas_derive_ak(ask, ak);
+        snprintf(label, sizeof(label), "%s: nk", v->name);
+        assert_eq_bytes(label, v->nk, nk, 32);
+        snprintf(label, sizeof(label), "%s: rivk", v->name);
+        assert_eq_bytes(label, v->rivk, rivk, 32);
+
+        /* rivk_internal — and its independence from the sign bit of the ak
+         * encoding (the derivation takes the normalised ak). */
+        uint8_t rivk_int[32], rivk_int2[32], ak_signed[32];
+        orchard_derive_rivk_internal(ak, nk, rivk, rivk_int);
+        snprintf(label, sizeof(label), "%s: rivk_internal%s", v->name,
+                 v->ak_odd ? " (odd y)" : "");
+        assert_eq_bytes(label, v->rivk_internal, rivk_int, 32);
+        memcpy(ak_signed, ak, 32);
+        ak_signed[31] |= 0x80;
+        orchard_derive_rivk_internal(ak_signed, nk, rivk, rivk_int2);
+        snprintf(label, sizeof(label), "%s: rivk_internal ignores ak sign bit", v->name);
+        assert_eq_bytes(label, v->rivk_internal, rivk_int2, 32);
+
+        /* Commit^ivk, one scope at a time and through the combined entry. */
+        uint8_t ivk_e[32], ivk_i[32], ivk_e2[32], ivk_i2[32];
+        int rc_e = orchard_commit_ivk(ak, nk, rivk, ivk_e);
+        int rc_i = orchard_commit_ivk(ak, nk, rivk_int, ivk_i);
+        snprintf(label, sizeof(label), "%s: ivk external", v->name);
+        assert_eq_bytes(label, v->ivk_external, ivk_e, 32);
+        snprintf(label, sizeof(label), "%s: ivk internal", v->name);
+        assert_eq_bytes(label, v->ivk_internal, ivk_i, 32);
+        int rc_b = orchard_derive_ivks(ak_signed, nk, rivk, ivk_e2, ivk_i2);
+        snprintf(label, sizeof(label), "%s: derive_ivks (both scopes, signed ak)", v->name);
+        check_true(label, rc_e == 0 && rc_i == 0 && rc_b == 0 &&
+                              memcmp(ivk_e2, v->ivk_external, 32) == 0 &&
+                              memcmp(ivk_i2, v->ivk_internal, 32) == 0);
+
+        /* Default change address: dk_internal from the internal FVK,
+         * d = FF1(dk_internal, 0), pk_d = [ivk_internal]·g_d. */
+        uint8_t dk_int[64], d_int[11], zero_idx[11] = {0}, pk_int[32];
+        {
+            blake2b_state S;
+            uint8_t tag = 0x82;
+            blake2b_InitPersonal(&S, 64, "Zcash_ExpandSeed", 16);
+            blake2b_Update(&S, rivk_int, 32);
+            blake2b_Update(&S, &tag, 1);
+            blake2b_Update(&S, ak, 32);
+            blake2b_Update(&S, nk, 32);
+            blake2b_Final(&S, dk_int, 64);
+        }
+        ff1_aes256_encrypt(dk_int, zero_idx, d_int);
+        snprintf(label, sizeof(label), "%s: change address d", v->name);
+        assert_eq_bytes(label, v->int_d, d_int, 11);
+        orchard_ivk_derive_pk_d(ivk_i, d_int, pk_int);
+        snprintf(label, sizeof(label), "%s: change address pk_d", v->name);
+        assert_eq_bytes(label, v->int_pk_d, pk_int, 32);
+
+        /* pk_d of the external addresses from ivk_external. */
+        uint8_t pk[32];
+        orchard_ivk_derive_pk_d(ivk_e, v->d, pk);
+        snprintf(label, sizeof(label), "%s: default address pk_d from ivk", v->name);
+        assert_eq_bytes(label, v->pk_d, pk, 32);
+        orchard_ivk_derive_pk_d(ivk_e, v->extj_d, pk);
+        snprintf(label, sizeof(label), "%s: address_at(0x%08x) pk_d from ivk", v->name,
+                 (unsigned)v->ext_j);
+        assert_eq_bytes(label, v->extj_pk_d, pk, 32);
+
+        /* The ownership predicate, every combination that matters. */
+        uint8_t neg_pk[32];
+        memcpy(neg_pk, v->int_pk_d, 32);
+        neg_pk[31] ^= 0x80; /* -pk_d: same x, not ours */
+        int own =
+            orchard_ivk_owns_address(ivk_i, v->int_d, v->int_pk_d) == 1 &&
+            orchard_ivk_owns_address(ivk_e, v->d, v->pk_d) == 1 &&
+            orchard_ivk_owns_address(ivk_e, v->extj_d, v->extj_pk_d) == 1 &&
+            orchard_ivk_owns_address(ivk_e, v->legacy_d, v->legacy_pk_d) == 1;
+        int cross =
+            orchard_ivk_owns_address(ivk_e, v->int_d, v->int_pk_d) == 0 &&
+            orchard_ivk_owns_address(ivk_i, v->d, v->pk_d) == 0 &&
+            orchard_ivk_owns_address(ivk_i, v->extj_d, v->extj_pk_d) == 0;
+        int foreign =
+            orchard_ivk_owns_address(ivk_e, other->d, other->pk_d) == 0 &&
+            orchard_ivk_owns_address(ivk_i, other->d, other->pk_d) == 0 &&
+            orchard_ivk_owns_address(ivk_e, other->int_d, other->int_pk_d) == 0 &&
+            orchard_ivk_owns_address(ivk_i, other->int_d, other->int_pk_d) == 0 &&
+            orchard_ivk_owns_address(ivk_i, v->int_d, neg_pk) == 0 &&
+            /* right pk_d, wrong diversifier */
+            orchard_ivk_owns_address(ivk_e, v->extj_d, v->pk_d) == 0;
+        snprintf(label, sizeof(label), "%s: own addresses recognised", v->name);
+        check_true(label, own);
+        snprintf(label, sizeof(label), "%s: scopes not confused", v->name);
+        check_true(label, cross);
+        snprintf(label, sizeof(label), "%s: foreign / negated / mismatched rejected", v->name);
+        check_true(label, foreign);
+    }
+
+    /* Degenerate keys: an all-zero ivk owns nothing (not even the encoding
+     * of the identity), and Commit^ivk never yields zero for real input. */
+    {
+        uint8_t zero_ivk[32] = {0}, zero_pk[32] = {0};
+        const address_vector* v = &ADDRESS_VECTORS[0];
+        check_true("zero ivk owns nothing",
+                   orchard_ivk_owns_address(zero_ivk, v->d, zero_pk) == 0 &&
+                   orchard_ivk_owns_address(zero_ivk, v->d, v->pk_d) == 0);
+    }
+}
+
 /* ── Main ── */
 
 int main(void) {
@@ -575,6 +696,7 @@ int main(void) {
     test_orchard_note_commit();
     test_orchard_encode_ua_raw();
     test_default_address_vectors();
+    test_viewing_key_vectors();
 
     printf("\n=== Results: %d/%d tests passed ===\n", passed_tests, total_tests);
 

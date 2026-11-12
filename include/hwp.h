@@ -49,28 +49,25 @@ _Static_assert(HWP_MAX_PAYLOAD >= 1420,
 // recipient-substitution attacks.
 #define HWP_NOTE_PLAINTEXT_SIZE  83
 
-// v6 (NU6.3 / Ironwood) action payloads — the ONLY layouts this library
-// accepts. A 1-byte pool tag (0x00 = sealed Orchard pool, 0x01 = Ironwood
-// pool) is prefixed to the action body; the dispatcher strips the tag and
-// routes the action into the matching ZIP-244 pool digest tree.
+// v6 (NU6.3 / Ironwood) action payload — the ONLY layout the device
+// accepts: a 1-byte pool tag (0x00 = sealed Orchard pool, 0x01 = Ironwood
+// pool) followed by the memo-carrying body. The dispatcher strips the tag
+// and routes the action into the matching ZIP-244 pool digest tree.
 //
-// Tag-stripped body layouts:
-//   compact (cmx-only):   action(820) + recipient(43) + value(8) + rseed(32)
-//                         = 903 bytes
-//   memo-verifying:       compact body + memo(512) = 1415 bytes
+//   body = action(820) + recipient(43) + value(8) + rseed(32) + memo(512)
+//        = 1415 bytes; on the wire 1 + 1415 = 1416 bytes
 //
-// With the memo-verifying body the device uses recipient/value/rseed/memo
-// to recompute the action's `enc_ciphertext` byte-for-byte; mismatch aborts
-// the session. Closes the memo-substitution attack that the cmx-only body
-// leaves open. `esk` is NOT on the wire: per ZIP-212 it is a deterministic
-// function of rseed + rho (= action's nullifier), so the device derives it
-// on-chip from the same inputs the companion already supplies.
+// The device uses recipient/value/rseed to recompute the action's note
+// commitment and, with the memo, its `enc_ciphertext` and `ephemeral_key`
+// byte-for-byte; a mismatch ends the session. `esk` is NOT on the wire: per
+// ZIP-212 it is a deterministic function of rseed + rho (= the action's
+// nullifier), so the device derives it itself.
 //
-// On-the-wire payload sizes (pool tag included):
-//   memo-verifying: 1 + 1415 = 1416 bytes
-//   cmx-only:       1 + 903  = 904 bytes
-// Legacy untagged v4/v5 payloads (903/1415 bytes) are rejected by the
-// dispatcher — post-NU6.3 every action must carry a pool tag.
+// EVERY action needs this body — zero-value padding too. The compact body
+// (same without the memo: 903 bytes, 904 on the wire) is refused with
+// Error(MEMO_REQUIRED); HWP_ACTION_BODY_COMPACT_SIZE and hwp_parse_action_v4
+// remain only so that a host library can name what it must not send. Legacy
+// untagged v4/v5 payloads (903/1415 bytes) are refused with Error(BAD_FRAME).
 #define HWP_POOL_TAG_SIZE 1
 #define HWP_ACTION_BODY_COMPACT_SIZE (HWP_ACTION_DATA_SIZE + HWP_NOTE_PLAINTEXT_SIZE) /* 903 */
 #define HWP_ACTION_BODY_MEMO_SIZE    (HWP_ACTION_BODY_COMPACT_SIZE + 512)             /* 1415 */
@@ -95,10 +92,18 @@ typedef enum {
     HWP_MSG_TX_OUTPUT     = 0x08, // Individual tx output for incremental hashing (v2)
     HWP_MSG_TX_OUTPUT_ACK = 0x09, // Output hash acknowledged (v2)
     HWP_MSG_ABORT        = 0x0A, // Cancel signing session
-    HWP_MSG_TX_TRANSPARENT_INPUT  = 0x0B, // Transparent input for digest verification (v3)
-    HWP_MSG_TX_TRANSPARENT_OUTPUT = 0x0C, // Transparent output for digest verification (v3)
-    HWP_MSG_TRANSPARENT_SIGN_REQ  = 0x0D, // Sign transparent input (ECDSA secp256k1, v3)
-    HWP_MSG_TRANSPARENT_SIGN_RSP  = 0x0E, // Transparent signature response (v3)
+    HWP_MSG_TX_TRANSPARENT_INPUT  = 0x0B, // Accepted ONLY as the sentinel that
+                                          // closes the transparent-output
+                                          // stream: index = total = 0 and the
+                                          // 32-byte transparent digest. Any
+                                          // frame announcing an input ->
+                                          // Error(TRANSPARENT_INPUTS_UNSUPPORTED)
+    HWP_MSG_TX_TRANSPARENT_OUTPUT = 0x0C, // Transparent output (P2PKH / P2SH):
+                                          // index[2] total[2] value[8]
+                                          // script_len[2] script[N], in order
+    HWP_MSG_TRANSPARENT_SIGN_REQ  = 0x0D, // RESERVED. Always answered with
+                                          // Error(TRANSPARENT_INPUTS_UNSUPPORTED)
+    HWP_MSG_TRANSPARENT_SIGN_RSP  = 0x0E, // RESERVED. Never sent.
     /* --- Device attestation (v4, audit M1) --- */
     HWP_MSG_IDENTITY_REQ = 0x0F, // Request device identity pubkey (no payload)
     HWP_MSG_IDENTITY_RSP = 0x10, // Identity response: device_pubkey[32]
@@ -124,8 +129,8 @@ typedef enum {
                                                 // constant (Orchard-only invariant)
     HWP_ERR_NOTE_COMMITMENT_MISMATCH    = 0x0D, // Recomputed cmx != action.cmx
                                                 // (recipient-substitution attempt)
-    HWP_ERR_RECIPIENT_MISMATCH          = 0x0E, // SIGN_REQ.recipient (UA) does
-                                                // not match any confirmed action
+    HWP_ERR_RECIPIENT_MISMATCH          = 0x0E, // RESERVED, no longer sent:
+                                                // SIGN_REQ.recipient is ignored
     HWP_ERR_MEMO_MISMATCH               = 0x0F, // Device-recomputed enc_ciphertext
                                                 // (or epk) does not match the
                                                 // action — companion lied about
@@ -139,16 +144,64 @@ typedef enum {
                                                 // value_balance combine to an
                                                 // out-of-range fee
     HWP_ERR_FEE_NEGATIVE                = 0x13, // t_in + value_balance < t_out
+    // The codes below were added with the on-device ownership / mandatory
+    // ciphertext checks. The Error frame layout is unchanged (code byte +
+    // message); a host that does not know a code reads it as "unknown" and
+    // still gets the message text.
+    HWP_ERR_MEMO_REQUIRED               = 0x14, // an action was sent as the
+                                                // compact (no-memo, 904 B)
+                                                // body. It is refused for every
+                                                // output, zero-value padding
+                                                // included: resend with the
+                                                // memo-carrying body (1416 B)
+    HWP_ERR_BRANCH_NOT_ALLOWED          = 0x15, // consensus branch ID not in
+                                                // the device's allow-list
+                                                // (firmware update needed for
+                                                // a newer network upgrade)
+    HWP_ERR_LIMIT_EXCEEDED              = 0x16, // more actions, memos or
+                                                // transparent outputs (> 8 by
+                                                // default) than the device can
+                                                // review, or a memo
+                                                // on a device without a memo
+                                                // screen. Nothing was skipped:
+                                                // the session was aborted
+    HWP_ERR_VALUE_OVERFLOW              = 0x17, // output value sums / total
+                                                // leaving the wallet overflow
+    HWP_ERR_TRANSPARENT_INPUTS_UNSUPPORTED = 0x18, // the transaction has
+                                                // transparent inputs, or a
+                                                // TRANSPARENT_SIGN_REQ was
+                                                // sent: spending from a
+                                                // t-address is not supported
+    HWP_ERR_EMPTY_POOL_BALANCE          = 0x19, // TxMeta declares a non-zero
+                                                // value balance for a pool
+                                                // (Orchard / Ironwood) that has
+                                                // no action in the transaction
 } HwpErrorCode;
 
 // FVK_REQ payload (v2.1+):
 //   coin_type[4 LE]   (133 = mainnet, 1 = testnet)
-// Empty payload accepted for backward compatibility (device uses default).
+// The device's network is fixed by its firmware. A request naming the other
+// network is answered with Error(NETWORK_MISMATCH); an empty payload or coin
+// type 0 ("not saying") is answered with the FVK. The request does not set
+// anything on the device. FVK_RSP carries ak || nk || rivk only — no
+// transparent key.
 #define HWP_FVK_REQ_SIZE 4
 
 // SIGN_REQ payload:
 //   sighash[32] || alpha[32] || amount[8 LE] || fee[8 LE] || recipient_len[1] || recipient[N]
 // Total: 81 + recipient_len
+//
+// The device USES sighash (must equal the sighash it verified, otherwise
+// Error(SIGHASH_MISMATCH) and the session ends) and alpha. amount, fee and
+// recipient are IGNORED: not validated, not displayed. recipient_len may be
+// 0; if it is not, it only has to match the payload length. The final
+// confirmation screen shows totals computed by the device.
+//
+// The device answers at most one SIGN_REQ per action of the approved
+// transaction, each for the verified sighash; with the last one the session
+// ends. A host that needs fewer signatures just stops asking: the next
+// TX_OUTPUT carrying a TxMeta (or PING / ABORT) ends the previous
+// transaction and clears every approval.
 #define HWP_SIGN_REQ_FIXED 81 // 32+32+8+8+1
 
 // Maximum recipient-string length. recipient_len is a single wire byte, so
@@ -189,9 +242,9 @@ typedef struct {
  *
  *   body = action[820] || recipient[43] || value[8 LE] || rseed[32]   (903 B)
  *
- * Pointers reference the original payload buffer (no copy). The device uses
- * `recipient`/`value`/`rseed` to recompute the action's NoteCommitment and
- * compares against `action[OFF_CMX]`. See `orchard_signer_feed_action_with_note`.
+ * Pointers reference the original payload buffer (no copy). THE DEVICE
+ * REFUSES THIS BODY (Error MEMO_REQUIRED): the struct and its parser remain
+ * for host-side code and tests.
  * (The struct keeps its historical V4 name; the layout is byte-identical.)
  */
 typedef struct {
@@ -300,14 +353,15 @@ bool hwp_parse_action_v4(const uint8_t* output_data, uint16_t output_data_len,
 bool hwp_parse_action_v5(const uint8_t* output_data, uint16_t output_data_len,
                          HwpActionV5* out);
 
-// TRANSPARENT_SIGN_REQ payload (v3):
-//   input_index[2 LE] || total_inputs[2 LE] ||
-//   input_data[N] (same wire format as TxTransparentInput data)
-// The device computes the per-input sighash on-device and signs with ECDSA.
+// TRANSPARENT_SIGN_REQ / TRANSPARENT_SIGN_RSP: reserved message IDs. The
+// device does not sign transparent inputs (README, "Transparent inputs are
+// not supported"); the request is answered with
+// Error(TRANSPARENT_INPUTS_UNSUPPORTED) and the session ends.
 //
-// TRANSPARENT_SIGN_RSP payload (v3):
-//   der_sig_len[1] || der_sig[N] || sighash_type[1] || pubkey[33]
-#define HWP_TRANSPARENT_SIGN_RSP_MAX (1 + 72 + 1 + 33) // 107
+// ERRORS END THE SESSION. Whenever the device sends an Error frame — for any
+// reason, including a CRC error, an unknown message type or an unsupported
+// version — it has discarded the transaction in progress and every approval
+// given for it. The host starts again from TxMeta.
 
 // Encode a TX_OUTPUT payload. Returns payload size.
 uint16_t hwp_encode_tx_output(uint8_t* payload, uint16_t output_index, uint16_t total_outputs,

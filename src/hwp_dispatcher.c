@@ -21,11 +21,16 @@
  *     in the CDC RX buffer (the drain callback only pulls one packet
  *     at a time now). No frames are lost.
  *
- *   - Transparent-output-only bootstrap: if the host sends a
- *     transparent-output stream with zero inputs (shielded → t-addr
- *     sweep), begin_transparent is invoked from the output handler
- *     with num_inputs=0; previously the state machine remained in
- *     RECEIVING_ACTIONS and rejected the first output.
+ *   - Transparent outputs (shielded → t-addr): begin_transparent is
+ *     invoked from the output handler with num_inputs=0. Transparent
+ *     INPUTS and transparent signing are refused: see README,
+ *     "Transparent inputs are not supported".
+ *
+ * ERROR RULE. Every Error frame this file sends ends the session: the
+ * signer is reset (viewing keys, hashes, approvals wiped) before the frame
+ * goes out, whatever the cause — a signer rejection, a malformed or
+ * unknown frame, a CRC or version error, a refusal by the user. There is
+ * one place that sends Error frames, send_error(), and it does the reset.
  */
 #include "hwp_dispatcher.h"
 
@@ -35,8 +40,6 @@
 #include "memzero.h"
 #include "orchard.h"
 #include "redpallas.h"
-#include "secp256k1.h"
-#include "segwit_addr.h"
 #include "zip244.h"
 #include "base58.h"
 
@@ -54,7 +57,7 @@
  *
  * Per-message handlers below are also marked noinline: at -O2 GCC was
  * folding their locals (sign-req scratch, per-output review buffers,
- * fvk payload, ECDSA scratch) into hwp_dispatcher_run's frame, and the
+ * fvk payload) into hwp_dispatcher_run's frame, and the
  * sum tripped the per-function limit even though no single handler
  * does. Forcing separate frames keeps each one comfortably under 512. */
 
@@ -75,8 +78,14 @@ static HWP_NOINLINE void send_frame(HwpDispatcher* d, uint8_t seq,
     d->io.serial_send(d->tx_buf, frame_len, d->user_ctx);
 }
 
+/* The ONLY place an Error frame is produced — and it ends the session.
+ * Whatever state the signer was in, after an error it is IDLE with nothing
+ * retained: a host cannot provoke an error and then carry on with the
+ * approvals it had. (The device's network survives, see
+ * orchard_signer_reset.) */
 static HWP_NOINLINE void send_error(HwpDispatcher* d, uint8_t seq,
                                      HwpErrorCode code, const char* msg) {
+    orchard_signer_reset(d->signer);
     size_t frame_len = hwp_encode_error(d->tx_buf, seq, code, msg);
     d->io.serial_send(d->tx_buf, frame_len, d->user_ctx);
     /* Make the error visible in the persistent UI footer. The actual
@@ -120,13 +129,18 @@ static HWP_NOINLINE void handle_ping(HwpDispatcher* d, HwpFrame* f,
 }
 
 static HWP_NOINLINE void handle_fvk_req(HwpDispatcher* d, HwpFrame* f) {
+    /* The device's network is the firmware's (d->testnet, and the coin type
+     * given to orchard_signer_init): the host can ask which one it expects,
+     * it cannot set it. A request that names the other network is refused;
+     * one that names none (empty payload, or coin type 0) is answered — the
+     * FVK is not a secret from the host, and the network check that
+     * matters is the one on every TxMeta. */
     if(f->payload_len >= HWP_FVK_REQ_SIZE) {
         uint32_t req_coin = (uint32_t)f->payload[0] |
                             ((uint32_t)f->payload[1] << 8) |
                             ((uint32_t)f->payload[2] << 16) |
                             ((uint32_t)f->payload[3] << 24);
-        uint32_t device_coin = d->testnet ? 1u : 133u;
-        if(req_coin != 0 && req_coin != device_coin) {
+        if(req_coin != 0 && req_coin != d->signer->coin_type) {
             send_error(d, f->seq, HWP_ERR_NETWORK_MISMATCH,
                        d->testnet ? "Device is on testnet"
                                   : "Device is on mainnet");
@@ -135,143 +149,267 @@ static HWP_NOINLINE void handle_fvk_req(HwpDispatcher* d, HwpFrame* f) {
                                           : "Companion requested TESTNET");
             return;
         }
-        d->signer->coin_type = req_coin;
     }
     uint8_t payload[96];
     memcpy(payload, d->keys.ak, 32);
     memcpy(payload + 32, d->keys.nk, 32);
     memcpy(payload + 64, d->keys.rivk, 32);
     send_frame(d, f->seq, HWP_MSG_FVK_RSP, payload, 96);
+    memzero(payload, sizeof(payload));
 }
 
-/* Drive the per-output review loop after the host's sighash sentinel.
- * The loop iterates BOTH classes of recipients the transaction touches:
- *
- *   1. Transparent outputs (count = signer->transparent_state.outputs_received)
- *      rendered as base58check t-addresses. These are typically the
- *      "real" recipient for shielded → t-addr sweeps; without showing
- *      them the user would sign blindly while only confirming the
- *      change Orchard outputs.
- *
- *   2. Orchard actions (count = signer->actions_received). Per the
- *      library invariant, orchard_signer_confirm_action() must be
- *      called for every action before verify() will advance to
- *      VERIFIED — without that, sign() refuses with NOT_VERIFIED.
- *
- * Returns true if every recipient was confirmed; false on cancel/exit. */
-static HWP_NOINLINE bool run_per_output_review(HwpDispatcher* d) {
-    uint16_t n_t = d->signer->transparent_state.outputs_received;
-    uint16_t n_o = d->signer->actions_received;
-    uint16_t total = (uint16_t)(n_t + n_o);
-    /* orchard_encode_ua_raw requires `ua_out_len >= 200` for its
-     * internal scratch (raw UA + padding + F4Jumble buffer). The
-     * encoded mainnet Orchard-only UA itself is ~106 chars; the
-     * 200-byte floor is defensive against future receiver types and
-     * the Bech32m max-length cap. */
-    char addr_buf[256];
+/* Report a signer error to the host and abort the session. One mapping
+ * for every handler, so each failure has one code and one message. */
+static HWP_NOINLINE void fail_signer(HwpDispatcher* d, uint8_t seq,
+                                      OrchardSignerError serr) {
+    HwpErrorCode code = HWP_ERR_BAD_FRAME;
+    const char* msg = "Bad transaction data";
+    switch(serr) {
+    case SIGNER_ERR_SAPLING_NOT_EMPTY:
+        code = HWP_ERR_SAPLING_NOT_EMPTY;
+        msg = "Sapling components not allowed (Orchard-only)";
+        break;
+    case SIGNER_ERR_BRANCH_NOT_ALLOWED:
+        code = HWP_ERR_BRANCH_NOT_ALLOWED;
+        msg = "Consensus branch not supported by this firmware";
+        break;
+    case SIGNER_ERR_BAD_FVK:
+        code = HWP_ERR_INVALID_STATE;
+        msg = "Device viewing key unavailable";
+        break;
+    case SIGNER_ERR_TOO_MANY_ACTIONS:
+        /* actions or transparent outputs */
+        code = HWP_ERR_LIMIT_EXCEEDED;
+        msg = "More outputs than the device can review";
+        break;
+    case SIGNER_ERR_TOO_MANY_MEMOS:
+        code = HWP_ERR_LIMIT_EXCEEDED;
+        msg = "More memos than the device can review";
+        break;
+    case SIGNER_ERR_NOTE_COMMITMENT_MISMATCH:
+        code = HWP_ERR_NOTE_COMMITMENT_MISMATCH;
+        msg = "Action cmx does not commit to claimed note";
+        break;
+    case SIGNER_ERR_MEMO_MISMATCH:
+        code = HWP_ERR_MEMO_MISMATCH;
+        msg = "enc_ciphertext does not match recomputed note/memo";
+        break;
+    case SIGNER_ERR_NETWORK_MISMATCH:
+        code = HWP_ERR_NETWORK_MISMATCH;
+        msg = "TxMeta coin_type is not the device's network";
+        break;
+    case SIGNER_ERR_NO_ACTIONS:
+        msg = "Transaction has no shielded actions";
+        break;
+    case SIGNER_ERR_EMPTY_POOL_BALANCE:
+        code = HWP_ERR_EMPTY_POOL_BALANCE;
+        msg = "Non-zero value balance for a pool without actions";
+        break;
+    case SIGNER_ERR_TRANSPARENT_INPUTS_UNSUPPORTED:
+        code = HWP_ERR_TRANSPARENT_INPUTS_UNSUPPORTED;
+        msg = "Transparent inputs are not supported";
+        break;
+    case SIGNER_ERR_TRANSPARENT_MISMATCH:
+        code = HWP_ERR_TRANSPARENT_DIGEST_MISMATCH;
+        msg = "Transparent digest mismatch";
+        break;
+    case SIGNER_ERR_TRANSPARENT_BAD_OUTPUT:
+        msg = "Bad transparent output (P2PKH / P2SH only)";
+        break;
+    case SIGNER_ERR_BAD_PK_D:
+        code = HWP_ERR_BAD_PK_D;
+        msg = "pk_d does not decode to a valid Pallas point";
+        break;
+    case SIGNER_ERR_FEE_OVERFLOW:
+        code = HWP_ERR_FEE_OVERFLOW;
+        msg = "Fee arithmetic overflow";
+        break;
+    case SIGNER_ERR_FEE_NEGATIVE:
+        code = HWP_ERR_FEE_NEGATIVE;
+        msg = "Negative fee (unbalanced transaction)";
+        break;
+    case SIGNER_ERR_VALUE_OVERFLOW:
+        code = HWP_ERR_VALUE_OVERFLOW;
+        msg = "Output values overflow";
+        break;
+    case SIGNER_ERR_SIGHASH_MISMATCH:
+        code = HWP_ERR_SIGHASH_MISMATCH;
+        msg = "Device sighash != companion sighash";
+        break;
+    case SIGNER_ERR_BAD_STATE:
+    case SIGNER_ERR_ACTION_NOT_CONFIRMED:
+    case SIGNER_ERR_FEE_NOT_CONFIRMED:
+    case SIGNER_ERR_TRANSPARENT_NOT_EMPTY:
+        code = HWP_ERR_INVALID_STATE;
+        msg = "Unexpected message for the current signing state";
+        break;
+    case SIGNER_ERR_BAD_META:
+        msg = "Bad TX metadata";
+        break;
+    default:
+        break;
+    }
+    send_error(d, seq, code, msg);   /* resets the signer */
+    if(serr == SIGNER_ERR_NETWORK_MISMATCH) {
+        show_network_error(d, "TX metadata network mismatch");
+    }
+}
 
-    /* Step 1: transparent outputs. */
+/* Outcome of the review driven by the sighash sentinel. */
+typedef enum {
+    REVIEW_OK = 0,
+    REVIEW_CANCELLED,     /* user said no, or the app is exiting */
+    REVIEW_SIGNER_ERROR,  /* *serr holds the signer's error */
+    REVIEW_NO_MEMO_UI,    /* a memo to read and no review_memo callback */
+    REVIEW_UNRENDERABLE,  /* an output could not be turned into an address */
+} ReviewResult;
+
+/* Step 1 of the review: transparent outputs, rendered as base58check
+ * t-addresses. These are typically the "real" recipient of a shielded →
+ * t-addr sweep. Always presented (and counted) as leaving the wallet. */
+static HWP_NOINLINE ReviewResult review_transparent_outputs(HwpDispatcher* d,
+                                                             uint16_t total_t,
+                                                             uint16_t total) {
+    uint16_t n_t = total_t;
+    char addr_buf[64];
     for(uint16_t i = 0; i < n_t; i++) {
         uint8_t script[25];
         size_t script_len = 0;
         uint64_t value = 0;
-        OrchardSignerError gerr =
-            orchard_signer_get_transparent_output_display(
-                d->signer, i, &value, script, sizeof(script), &script_len);
-        if(gerr != SIGNER_OK) return false;
-        size_t enc = script_to_taddr(script, script_len, d->testnet,
-                                      addr_buf, sizeof(addr_buf));
-        if(enc == 0) {
-            /* Non-standard script: the lib already refused at feed
-             * time, but if we somehow got here without a renderable
-             * address we cannot satisfy no-blind-signing. */
-            return false;
+        if(orchard_signer_get_transparent_output_display(
+               d->signer, i, &value, script, sizeof(script), &script_len) != SIGNER_OK) {
+            return REVIEW_UNRENDERABLE;
         }
-        phase(d, HWP_PHASE_REVIEW, (uint16_t)(i + 1), total);
-        HwpUiResult r = d->ui.review_output((uint16_t)(i + 1), total,
-                                              addr_buf, value, d->user_ctx);
-        if(r != HWP_UI_OK) return false;
+        if(script_to_taddr(script, script_len, d->testnet,
+                           addr_buf, sizeof(addr_buf)) == 0) {
+            /* Non-standard script: the lib already refused at feed time,
+             * but without a renderable address there is nothing to show. */
+            return REVIEW_UNRENDERABLE;
+        }
+        HwpOutputReview rv = {
+            .kind = HWP_OUTPUT_TRANSPARENT,
+            .index = (uint16_t)(i + 1),
+            .total = total,
+            .address = addr_buf,
+            .value = value,
+            .memo = HWP_MEMO_NOT_APPLICABLE,
+            .has_memo = false,
+        };
+        phase(d, HWP_PHASE_REVIEW, rv.index, total);
+        if(d->ui.review_output(&rv, d->user_ctx) != HWP_UI_OK) return REVIEW_CANCELLED;
     }
+    return REVIEW_OK;
+}
 
-    /* Step 2: Orchard actions. */
+/* Step 2 of the review: shielded outputs. The kind shown to the user is
+ * the signer's own classification; address, value and memo are the ones
+ * the note commitment and ciphertext checks tied to the action. Outputs
+ * verified to carry neither value nor a memo are padding: they are not
+ * shown (the signer has already confirmed them and counts them in the
+ * totals). Every other output is sent to the UI and is confirmed only if
+ * the callback returns HWP_UI_OK. */
+static HWP_NOINLINE ReviewResult review_shielded_outputs(HwpDispatcher* d,
+                                                          uint16_t first_index,
+                                                          uint16_t total) {
+    /* orchard_encode_ua_raw requires ua_out_len >= 200; the encoded
+     * Orchard-only UA itself is ~106 chars (mainnet) / ~110 (testnet). */
+    char addr_buf[200];
     const char* hrp = d->testnet ? "utest" : "u";
+    uint16_t n_o = d->signer->actions_received;
+    uint16_t shown = first_index;
+
     for(uint16_t i = 0; i < n_o; i++) {
-        uint8_t recipient[43];
-        uint64_t value;
-        OrchardSignerError gerr =
-            orchard_signer_get_action_display(d->signer, i, recipient, &value);
-        if(gerr != SIGNER_OK) return false;
-        int enc = orchard_encode_ua_raw(recipient, recipient + 11, hrp,
-                                         addr_buf, sizeof(addr_buf));
-        if(enc <= 0) return false;
+        OrchardOutputInfo info;
+        if(orchard_signer_get_output(d->signer, i, &info) != SIGNER_OK) {
+            return REVIEW_UNRENDERABLE;
+        }
+        if(!info.review_required) continue;
 
-        phase(d, HWP_PHASE_REVIEW, (uint16_t)(n_t + i + 1), total);
-        HwpUiResult r = d->ui.review_output((uint16_t)(n_t + i + 1), total,
-                                              addr_buf, value, d->user_ctx);
-        if(r != HWP_UI_OK) return false;
+        if(orchard_encode_ua_raw(info.recipient, info.recipient + 11, hrp,
+                                  addr_buf, sizeof(addr_buf)) <= 0) {
+            return REVIEW_UNRENDERABLE;
+        }
+        /* A memo the user cannot be shown is a reason to stop, before the
+         * user is asked to approve the output it belongs to. */
+        if(info.has_memo && d->ui.review_memo == NULL) return REVIEW_NO_MEMO_UI;
 
-        /* Memo review — only when (a) the firmware opted into the memo UI
-         * callback, AND (b) the action was fed via the v5 (memo-aware)
-         * path, AND (c) the memo is not the ZIP-302 empty-memo sentinel
-         * (lead byte 0xF6). The cryptographic binding from
-         * feed_action_with_note_and_memo() ensures the bytes the user
-         * sees here are byte-for-byte what ends up in the on-chain
-         * enc_ciphertext, closing the "memo bound but not user-visible"
-         * gap that AEAD recomputation alone leaves open.
-         *
-         * `memo_buf` is static to keep run_per_output_review under the
-         * 512 B per-function stack budget — same pattern used elsewhere
-         * for the larger Pallas / AEAD scratchpads. Single-threaded
-         * signer => no re-entrancy. */
-        if(d->ui.review_memo != NULL) {
+        HwpOutputReview rv = {
+            .kind = HWP_OUTPUT_EXTERNAL,
+            .index = shown,
+            .total = total,
+            .address = addr_buf,
+            .value = info.value,
+            .memo = info.has_memo ? HWP_MEMO_PRESENT : HWP_MEMO_NONE,
+            .has_memo = info.has_memo,
+        };
+        if(info.ownership == ORCHARD_OUTPUT_OWN_INTERNAL) {
+            rv.kind = HWP_OUTPUT_OWN_CHANGE;
+        } else if(info.ownership == ORCHARD_OUTPUT_OWN_EXTERNAL) {
+            rv.kind = HWP_OUTPUT_OWN_ADDRESS;
+        }
+
+        phase(d, HWP_PHASE_REVIEW, shown, total);
+        if(d->ui.review_output(&rv, d->user_ctx) != HWP_UI_OK) return REVIEW_CANCELLED;
+
+        if(info.has_memo) {
+            /* The bytes shown are the ones the device verified against the
+             * on-chain enc_ciphertext. `memo_buf` is static to keep this
+             * frame under the 512 B per-function stack budget; it is wiped
+             * as soon as the screen returns. */
             static uint8_t memo_buf[512];
-            bool memo_present = false;
-            if(orchard_signer_get_action_memo(d->signer, i, memo_buf, &memo_present)
-               == SIGNER_OK && memo_present && memo_buf[0] != 0xF6) {
-                HwpUiResult rm = d->ui.review_memo(
-                    (uint16_t)(n_t + i + 1), total,
-                    addr_buf, memo_buf, d->user_ctx);
-                memzero(memo_buf, sizeof(memo_buf));
-                if(rm != HWP_UI_OK) return false;
+            bool present = false;
+            HwpUiResult rm = HWP_UI_CANCELLED;
+            if(orchard_signer_get_action_memo(d->signer, i, memo_buf, &present) ==
+                   SIGNER_OK && present) {
+                rm = d->ui.review_memo(shown, total, addr_buf, memo_buf, d->user_ctx);
             }
-            /* static scratch: do not keep the memo plaintext past the review */
             memzero(memo_buf, sizeof(memo_buf));
+            if(rm != HWP_UI_OK) return REVIEW_CANCELLED;
         }
 
         if(orchard_signer_confirm_action(d->signer, i) != SIGNER_OK) {
-            return false;
+            return REVIEW_UNRENDERABLE;
         }
+        shown++;
+    }
+    return REVIEW_OK;
+}
+
+/* Drive the review after the host's sighash sentinel:
+ *   0. totals computed first — this also proves the transaction is
+ *      complete and its sums are in range before the user is asked
+ *      anything;
+ *   1. transparent outputs;
+ *   2. shielded outputs (own change / own address / external);
+ *   3. the totals: what leaves the wallet, and the fee.
+ * The signer refuses verify() unless 2 and 3 were confirmed. */
+static HWP_NOINLINE ReviewResult run_per_output_review(HwpDispatcher* d,
+                                                        OrchardSignerError* serr) {
+    OrchardSignerTotals totals;
+    *serr = orchard_signer_get_totals(d->signer, &totals);
+    if(*serr != SIGNER_OK) return REVIEW_SIGNER_ERROR;
+
+    uint16_t n_t = totals.n_transparent_out;
+    uint16_t n_shown = n_t;
+    for(uint16_t i = 0; i < d->signer->actions_received; i++) {
+        OrchardOutputInfo info;
+        if(orchard_signer_get_output(d->signer, i, &info) != SIGNER_OK) {
+            return REVIEW_UNRENDERABLE;
+        }
+        if(info.review_required) n_shown++;
     }
 
-    /* Step 3: miner fee. The library refuses to advance verify() past
-     * SIGNER_VERIFIED unless the user has approved the on-device-computed
-     * fee value (no-blind-signing-for-fee invariant). Compute it from
-     * already-collected meta + transparent state, show it on the trusted
-     * screen, and propagate the user's decision to confirm_fee(). */
-    uint64_t fee_zats = 0;
-    OrchardSignerError ferr = orchard_signer_get_fee(d->signer, &fee_zats);
-    if(ferr != SIGNER_OK) {
-        /* FEE_OVERFLOW or FEE_NEGATIVE: the lib has already reset ctx. */
-        return false;
-    }
-    phase(d, HWP_PHASE_REVIEW, (uint16_t)(total + 1), (uint16_t)(total + 1));
-    HwpUiResult fee_r;
-    if(d->ui.review_fee != NULL) {
-        fee_r = d->ui.review_fee(fee_zats, d->user_ctx);
-    } else {
-        /* Backward-compat fallback: render the fee as a synthetic
-         * extra output entry. UI sees idx = total+1 with addr_str =
-         * "Network fee", value = fee_zats. */
-        fee_r = d->ui.review_output(
-            (uint16_t)(total + 1), (uint16_t)(total + 1),
-            "Network fee", fee_zats, d->user_ctx);
-    }
-    if(fee_r != HWP_UI_OK) return false;
+    ReviewResult r = review_transparent_outputs(d, n_t, n_shown);
+    if(r != REVIEW_OK) return r;
+    r = review_shielded_outputs(d, (uint16_t)(n_t + 1), n_shown);
+    if(r != REVIEW_OK) return r;
 
-    if(orchard_signer_confirm_fee(d->signer) != SIGNER_OK) {
-        return false;
-    }
-    return true;
+    phase(d, HWP_PHASE_REVIEW, (uint16_t)(n_shown + 1), (uint16_t)(n_shown + 1));
+    if(d->ui.review_totals(&totals, d->user_ctx) != HWP_UI_OK) return REVIEW_CANCELLED;
+
+    *serr = orchard_signer_confirm_totals(d->signer);
+    if(*serr != SIGNER_OK) return REVIEW_SIGNER_ERROR;
+    return REVIEW_OK;
 }
 
 /* TX_OUTPUT handler. The host packs three different things into this
@@ -291,85 +429,96 @@ static HWP_NOINLINE bool handle_tx_output(HwpDispatcher* d, HwpFrame* f) {
 
     OrchardSignerError serr;
     if(txo.output_index == HWP_TX_META_INDEX) {
-        serr = orchard_signer_feed_meta(d->signer, txo.output_data,
+        /* A TxMeta always starts a new transaction from nothing. Whatever
+         * was in progress — a half-streamed transaction, or a verified one
+         * the host asked fewer signatures for than it has actions — is
+         * dropped with all its approvals. Nothing carries over. */
+        orchard_signer_reset(d->signer);
+        /* The session's incoming viewing keys are derived here, from the
+         * device's own full viewing key (two Commit^ivk). */
+        if(d->ui.progress) d->ui.progress(0, "Preparing...", d->user_ctx);
+        OrchardSignerFvk fvk = {
+            .ak = d->keys.ak, .nk = d->keys.nk, .rivk = d->keys.rivk};
+        serr = orchard_signer_feed_meta(d->signer, &fvk, txo.output_data,
                                          txo.output_data_len, txo.total_outputs);
-        phase(d, HWP_PHASE_META, 0, txo.total_outputs);
-        if(serr == SIGNER_ERR_NETWORK_MISMATCH) {
-            send_error(d, f->seq, HWP_ERR_NETWORK_MISMATCH,
-                       "TxMeta coin_type != session coin_type");
-            show_network_error(d, "TX metadata network mismatch");
-            orchard_signer_reset(d->signer);
-            return false;
-        } else if(serr == SIGNER_ERR_SAPLING_NOT_EMPTY) {
-            send_error(d, f->seq, HWP_ERR_SAPLING_NOT_EMPTY,
-                       "Sapling components not allowed (Orchard-only)");
-            orchard_signer_reset(d->signer);
-            return false;
-        } else if(serr == SIGNER_ERR_TOO_MANY_ACTIONS) {
-            send_error(d, f->seq, HWP_ERR_BAD_FRAME,
-                       "Transaction has more outputs than the device can display");
-            orchard_signer_reset(d->signer);
-            return false;
-        } else if(serr != SIGNER_OK) {
-            send_error(d, f->seq, HWP_ERR_BAD_FRAME, "Bad TX metadata");
-            orchard_signer_reset(d->signer);
+        if(serr != SIGNER_OK) {
+            fail_signer(d, f->seq, serr);
             return false;
         }
+        phase(d, HWP_PHASE_META, 0, txo.total_outputs);
     } else if(txo.output_index == txo.total_outputs) {
         /* Sighash sentinel. */
         if(txo.output_data_len != 32) {
             send_error(d, f->seq, HWP_ERR_BAD_SIGHASH, "Bad sighash length");
-            orchard_signer_reset(d->signer);
             return false;
         }
-        if(!run_per_output_review(d)) {
-            send_error(d, f->seq, HWP_ERR_USER_CANCELLED,
-                       "User cancelled per-output review");
-            orchard_signer_reset(d->signer);
+        /* The review runs once, for the transaction TxMeta announced: no
+         * screen is shown for a sentinel that arrives early, twice, or
+         * with another action count. */
+        if(d->signer->state != SIGNER_RECEIVING_ACTIONS ||
+           txo.total_outputs != d->signer->actions_expected ||
+           d->signer->actions_received != d->signer->actions_expected) {
+            send_error(d, f->seq, HWP_ERR_INVALID_STATE,
+                       "Sighash sentinel out of sequence");
             return false;
         }
-        /* The lib's verify() runs Sinsemilla over Pallas — multi-second
-         * on STM32. The progress callback will fire from inside pallas
-         * if the app wired pallas_set_progress_cb. */
+        ReviewResult rr = run_per_output_review(d, &serr);
+        if(rr == REVIEW_SIGNER_ERROR) {
+            fail_signer(d, f->seq, serr);
+            return false;
+        } else if(rr != REVIEW_OK) {
+            if(rr == REVIEW_NO_MEMO_UI) {
+                send_error(d, f->seq, HWP_ERR_LIMIT_EXCEEDED,
+                           "Output carries a memo this device cannot display");
+            } else if(rr == REVIEW_UNRENDERABLE) {
+                send_error(d, f->seq, HWP_ERR_INVALID_STATE,
+                           "Output cannot be displayed");
+            } else {
+                send_error(d, f->seq, HWP_ERR_USER_CANCELLED,
+                           "User cancelled the review");
+            }
+            return false;
+        }
         if(d->ui.progress) d->ui.progress(0, "Verifying ZIP-244 sighash...", d->user_ctx);
         serr = orchard_signer_verify(d->signer, txo.output_data);
-        if(serr == SIGNER_ERR_SIGHASH_MISMATCH) {
-            send_error(d, f->seq, HWP_ERR_SIGHASH_MISMATCH,
-                       "Device sighash != companion sighash");
-            orchard_signer_reset(d->signer);
-            return false;
-        } else if(serr != SIGNER_OK) {
-            send_error(d, f->seq, HWP_ERR_INVALID_STATE, "Verify failed");
-            orchard_signer_reset(d->signer);
+        if(serr != SIGNER_OK) {
+            fail_signer(d, f->seq, serr);
             return false;
         }
     } else {
-        /* Action data 0..N-1. v6-only intake (post-NU6.3): every action
-         * payload MUST carry a 1-byte pool tag (0x00 = sealed Orchard,
-         * 0x01 = Ironwood) followed by either the memo-verifying body
-         * (1415 B, on-wire 1416) or the compact cmx-only body (903 B,
-         * on-wire 904). Legacy untagged v4/v5 payloads (903/1415 B) hit
-         * the size gate below and are rejected. The memo-verifying path
-         * additionally verifies enc_ciphertext + epk on-device, closing
-         * the memo-substitution attack that cmx-only leaves open; the
-         * tag routes the action into the matching ZIP-244 pool digest
-         * tree. */
+        /* Action data 0..N-1. Every action payload is the 1-byte pool tag
+         * (0x00 = sealed Orchard, 0x01 = Ironwood) followed by the
+         * memo-carrying body: 1416 bytes on the wire. The compact
+         * (no-memo, 904 B) body is refused for every output — the device
+         * recomputes every ciphertext — and so is anything else, the
+         * untagged pre-v6 layouts included. */
         phase(d, HWP_PHASE_VERIFY,
               (uint16_t)(txo.output_index + 1), txo.total_outputs);
         if(d->ui.progress) {
             d->ui.progress(0, "Verifying output...", d->user_ctx);
         }
 
-        if(txo.output_data_len != HWP_ACTION_DATA_SIZE_V6 &&
-           txo.output_data_len != HWP_ACTION_DATA_SIZE_V6_COMPACT) {
+        if(txo.output_data_len == HWP_ACTION_DATA_SIZE_V6_COMPACT) {
+            send_error(d, f->seq, HWP_ERR_MEMO_REQUIRED,
+                       "Compact action body refused: send the memo-carrying body");
+            return false;
+        }
+        if(txo.output_data_len != HWP_ACTION_DATA_SIZE_V6) {
             send_error(d, f->seq, HWP_ERR_BAD_FRAME,
-                       "Action payload must be v6 pool-tagged (904/1416 B)");
-            orchard_signer_reset(d->signer);
+                       "Action payload must be v6 pool-tagged with memo (1416 B)");
             return false;
         }
         if(txo.output_data[0] > ZIP244_POOL_IRONWOOD) {
             send_error(d, f->seq, HWP_ERR_BAD_FRAME,
                        "Bad v6 action pool tag");
+            return false;
+        }
+        /* The index must be the next one: an action cannot be replayed,
+         * skipped or re-ordered into a different slot. */
+        if(txo.output_index != d->signer->actions_received ||
+           txo.total_outputs != d->signer->actions_expected) {
+            send_error(d, f->seq, HWP_ERR_INVALID_STATE,
+                       "Action out of sequence");
             orchard_signer_reset(d->signer);
             return false;
         }
@@ -377,76 +526,29 @@ static HWP_NOINLINE bool handle_tx_output(HwpDispatcher* d, HwpFrame* f) {
         const uint8_t* adata = txo.output_data + HWP_POOL_TAG_SIZE;
         size_t alen = (size_t)txo.output_data_len - HWP_POOL_TAG_SIZE;
 
-        if(alen == HWP_ACTION_BODY_MEMO_SIZE) {
-            HwpActionV5 av5;
-            if(!hwp_parse_action_v5(adata, (uint16_t)alen, &av5)) {
-                send_error(d, f->seq, HWP_ERR_BAD_FRAME,
-                           "Action memo-body size mismatch");
-                orchard_signer_reset(d->signer);
-                return false;
-            }
-            serr = orchard_signer_feed_action_with_note_and_memo(
-                d->signer, pool, av5.action, HWP_ACTION_DATA_SIZE,
-                av5.recipient, av5.value, av5.rseed,
-                av5.memo);
-            if(serr == SIGNER_ERR_NOTE_COMMITMENT_MISMATCH) {
-                send_error(d, f->seq, HWP_ERR_NOTE_COMMITMENT_MISMATCH,
-                           "Action cmx does not commit to claimed note");
-                orchard_signer_reset(d->signer);
-                return false;
-            } else if(serr == SIGNER_ERR_MEMO_MISMATCH) {
-                send_error(d, f->seq, HWP_ERR_MEMO_MISMATCH,
-                           "enc_ciphertext does not match recomputed memo/esk");
-                orchard_signer_reset(d->signer);
-                return false;
-            } else if(serr == SIGNER_ERR_BAD_PK_D) {
-                send_error(d, f->seq, HWP_ERR_BAD_PK_D,
-                           "pk_d does not decode to a valid Pallas point");
-                orchard_signer_reset(d->signer);
-                return false;
-            } else if(serr == SIGNER_ERR_TOO_MANY_ACTIONS) {
-                send_error(d, f->seq, HWP_ERR_BAD_FRAME,
-                           "Transaction has more outputs than the device can display");
-                orchard_signer_reset(d->signer);
-                return false;
-            } else if(serr != SIGNER_OK) {
-                send_error(d, f->seq, HWP_ERR_BAD_FRAME, "Bad action v5 data");
-                orchard_signer_reset(d->signer);
-                return false;
-            }
-        } else {
-            /* Compact (cmx-only) body — used when the host has no memo
-             * plaintext to bind (e.g. OVK-None outputs). */
-            HwpActionV4 av4;
-            if(!hwp_parse_action_v4(adata, (uint16_t)alen, &av4)) {
-                send_error(d, f->seq, HWP_ERR_BAD_FRAME,
-                           "Action payload size mismatch");
-                orchard_signer_reset(d->signer);
-                return false;
-            }
-            serr = orchard_signer_feed_action_with_note(
-                d->signer, pool, av4.action, HWP_ACTION_DATA_SIZE,
-                av4.recipient, av4.value, av4.rseed);
-            if(serr == SIGNER_ERR_NOTE_COMMITMENT_MISMATCH) {
-                send_error(d, f->seq, HWP_ERR_NOTE_COMMITMENT_MISMATCH,
-                           "Action cmx does not commit to claimed recipient/value/rseed");
-                orchard_signer_reset(d->signer);
-                return false;
-            } else if(serr == SIGNER_ERR_TOO_MANY_ACTIONS) {
-                send_error(d, f->seq, HWP_ERR_BAD_FRAME,
-                           "Transaction has more outputs than the device can display");
-                orchard_signer_reset(d->signer);
-                return false;
-            } else if(serr != SIGNER_OK) {
-                send_error(d, f->seq, HWP_ERR_BAD_FRAME, "Bad action data");
-                orchard_signer_reset(d->signer);
-                return false;
-            }
+        HwpActionV5 av5;
+        if(!hwp_parse_action_v5(adata, (uint16_t)alen, &av5)) {
+            send_error(d, f->seq, HWP_ERR_BAD_FRAME,
+                       "Action memo-body size mismatch");
+            return false;
+        }
+        serr = orchard_signer_feed_action_with_note_and_memo(
+            d->signer, pool, av5.action, HWP_ACTION_DATA_SIZE,
+            av5.recipient, av5.value, av5.rseed,
+            av5.memo);
+        if(serr != SIGNER_OK) {
+            fail_signer(d, f->seq, serr);
+            return false;
         }
     }
     return true;
 }
 
+/* TX_TRANSPARENT_INPUT. Transparent inputs are not supported, so the only
+ * frame of this type the device accepts is the one that carries no input:
+ * index == total == 0 with the 32-byte transparent digest — the sentinel
+ * that closes the transparent-output stream. Anything announcing an input
+ * ends the session with TRANSPARENT_INPUTS_UNSUPPORTED. */
 static HWP_NOINLINE void handle_tx_transparent_input(HwpDispatcher* d,
                                                        HwpFrame* f) {
     if(f->payload_len < HWP_TX_OUTPUT_HEADER) {
@@ -462,50 +564,28 @@ static HWP_NOINLINE void handle_tx_transparent_input(HwpDispatcher* d,
 
     phase(d, HWP_PHASE_TRANSPARENT, 0, 0);
 
-    /* First input → begin transparent session. */
-    if(input_index == 0 && d->signer->state == SIGNER_RECEIVING_ACTIONS) {
-        OrchardSignerError berr =
-            orchard_signer_begin_transparent(d->signer, total_inputs, 0);
-        if(berr != SIGNER_OK) {
-            send_error(d, f->seq, HWP_ERR_INVALID_STATE, "Cannot begin transparent");
-            orchard_signer_reset(d->signer);
-            return;
-        }
-    }
-
-    /* Sentinel: index == total → verify digest. */
-    if(input_index == total_inputs) {
-        if(t_data_len != 32) {
-            send_error(d, f->seq, HWP_ERR_BAD_FRAME,
-                       "Transparent sentinel must be 32 bytes");
-            orchard_signer_reset(d->signer);
-            return;
-        }
-        OrchardSignerError serr =
-            orchard_signer_verify_transparent(d->signer, t_data);
-        if(serr == SIGNER_ERR_TRANSPARENT_MISMATCH) {
-            send_error(d, f->seq, HWP_ERR_TRANSPARENT_DIGEST_MISMATCH,
-                       "Transparent digest mismatch");
-            return;
-        } else if(serr != SIGNER_OK) {
-            send_error(d, f->seq, HWP_ERR_INVALID_STATE,
-                       "Transparent verify failed");
-            orchard_signer_reset(d->signer);
-            return;
-        }
-        send_frame(d, f->seq, HWP_MSG_TX_OUTPUT_ACK, NULL, 0);
+    if(total_inputs != 0 || input_index != 0) {
+        fail_signer(d, f->seq, SIGNER_ERR_TRANSPARENT_INPUTS_UNSUPPORTED);
         return;
     }
-
-    /* Normal input data. */
-    OrchardSignerError serr =
-        orchard_signer_feed_transparent_input(d->signer, t_data, t_data_len);
+    if(t_data_len != 32) {
+        send_error(d, f->seq, HWP_ERR_BAD_FRAME,
+                   "Transparent sentinel must be 32 bytes");
+        return;
+    }
+    /* A host may close an empty transparent stream too (no outputs): the
+     * digest is then the empty-bundle constant. */
+    if(d->signer->state == SIGNER_RECEIVING_ACTIONS &&
+       !d->signer->transparent_begun) {
+        OrchardSignerError berr = orchard_signer_begin_transparent(d->signer, 0, 0);
+        if(berr != SIGNER_OK) {
+            fail_signer(d, f->seq, berr);
+            return;
+        }
+    }
+    OrchardSignerError serr = orchard_signer_verify_transparent(d->signer, t_data);
     if(serr != SIGNER_OK) {
-        HwpErrorCode code = (serr == SIGNER_ERR_BAD_STATE)
-                                ? HWP_ERR_INVALID_STATE
-                                : HWP_ERR_BAD_FRAME;
-        send_error(d, f->seq, code, "Bad transparent input");
-        orchard_signer_reset(d->signer);
+        fail_signer(d, f->seq, serr);
         return;
     }
     send_frame(d, f->seq, HWP_MSG_TX_OUTPUT_ACK, NULL, 0);
@@ -526,92 +606,62 @@ static HWP_NOINLINE void handle_tx_transparent_output(HwpDispatcher* d,
 
     phase(d, HWP_PHASE_TRANSPARENT, 0, 0);
 
-    /* Output-only transparent flow (shielded → t-addr sweep, zero
-     * transparent inputs): the state machine starts in
-     * RECEIVING_ACTIONS until begin_transparent runs; without this
-     * bootstrap, feed_transparent_output would return BAD_STATE and
-     * the session would deadlock. */
+    /* The first output opens the transparent pass (no inputs: shielded →
+     * t-address). More outputs than the device can show are refused here,
+     * with LIMIT_EXCEEDED, before any is hashed. */
     if(output_index == 0 && d->signer->state == SIGNER_RECEIVING_ACTIONS) {
         OrchardSignerError berr =
             orchard_signer_begin_transparent(d->signer, 0, total_outputs);
         if(berr != SIGNER_OK) {
-            send_error(d, f->seq, HWP_ERR_INVALID_STATE,
-                       "Cannot begin transparent (output-only)");
-            orchard_signer_reset(d->signer);
+            fail_signer(d, f->seq, berr);
             return;
         }
     }
-
-    /* Inputs-then-outputs: begin already ran with outputs_expected=0;
-     * fill it from the first output's total. */
-    if(output_index == 0 && d->signer->transparent_outputs_expected == 0) {
-        d->signer->transparent_outputs_expected = total_outputs;
+    /* Like actions: the index must be the next one and the announced total
+     * must not change. */
+    if(d->signer->state != SIGNER_RECEIVING_TRANSPARENT ||
+       output_index != d->signer->transparent_state.outputs_received ||
+       total_outputs != d->signer->transparent_outputs_expected) {
+        send_error(d, f->seq, HWP_ERR_INVALID_STATE,
+                   "Transparent output out of sequence");
+        return;
     }
 
     OrchardSignerError serr =
         orchard_signer_feed_transparent_output(d->signer, t_data, t_data_len);
     if(serr != SIGNER_OK) {
-        HwpErrorCode code = (serr == SIGNER_ERR_BAD_STATE)
-                                ? HWP_ERR_INVALID_STATE
-                                : HWP_ERR_BAD_FRAME;
-        send_error(d, f->seq, code, "Bad transparent output");
-        orchard_signer_reset(d->signer);
+        fail_signer(d, f->seq, serr);
         return;
     }
     send_frame(d, f->seq, HWP_MSG_TX_OUTPUT_ACK, NULL, 0);
 }
 
+/* TRANSPARENT_SIGN_REQ: refused, always. The message ID stays reserved.
+ * The dispatcher holds no transparent key (HwpDispatcherKeys has no field
+ * for one) and the library compiles no ECDSA signing by default. */
 static HWP_NOINLINE void handle_transparent_sign_req(HwpDispatcher* d,
                                                        HwpFrame* f) {
-    if(f->payload_len < HWP_TX_OUTPUT_HEADER) {
-        send_error(d, f->seq, HWP_ERR_BAD_FRAME,
-                   "Transparent sign req too short");
-        return;
-    }
-    uint16_t input_index =
-        (uint16_t)f->payload[0] | ((uint16_t)f->payload[1] << 8);
-    const uint8_t* input_data = f->payload + HWP_TX_OUTPUT_HEADER;
-    uint16_t input_data_len = (uint16_t)(f->payload_len - HWP_TX_OUTPUT_HEADER);
-
-    if(!d->signer->transparent_verified) {
-        send_error(d, f->seq, HWP_ERR_INVALID_STATE,
-                   "Transparent not verified");
-        return;
-    }
-
-    uint8_t per_input_sighash[32];
-    zip244_transparent_per_input_sighash(
-        &d->signer->transparent_state, input_index,
-        input_data, input_data_len, 0x01, per_input_sighash);
-
-    uint8_t compact_sig[64];
-    if(secp256k1_ecdsa_sign_digest(d->keys.t_sk, per_input_sighash,
-                                    compact_sig) != 0) {
-        memzero(per_input_sighash, sizeof(per_input_sighash));
-        send_error(d, f->seq, HWP_ERR_SIGN_FAILED, "ECDSA sign failed");
-        return;
-    }
-    uint8_t der_sig[72];
-    size_t der_len = secp256k1_sig_to_der(compact_sig, der_sig);
-    memzero(compact_sig, sizeof(compact_sig));
-
-    uint8_t rsp[HWP_TRANSPARENT_SIGN_RSP_MAX];
-    rsp[0] = (uint8_t)der_len;
-    memcpy(rsp + 1, der_sig, der_len);
-    rsp[1 + der_len] = 0x01;  /* SIGHASH_ALL */
-    memcpy(rsp + 1 + der_len + 1, d->keys.t_pubkey, 33);
-
-    size_t rsp_len = 1 + der_len + 1 + 33;
-    send_frame(d, f->seq, HWP_MSG_TRANSPARENT_SIGN_RSP, rsp, (uint16_t)rsp_len);
-    memzero(per_input_sighash, sizeof(per_input_sighash));
+    send_error(d, f->seq, HWP_ERR_TRANSPARENT_INPUTS_UNSUPPORTED,
+               "Transparent signing is not supported");
 }
 
+/* SIGN_REQ. Only two fields are used: the sighash, which must be the one
+ * the device computed and verified, and alpha. amount, fee and recipient
+ * are the host's words about a transaction the device has already examined
+ * itself: they are parsed for framing and otherwise IGNORED — not checked,
+ * not shown. (An earlier revision showed the recipient string on the final
+ * screen after matching it against "any action"; a host could name there an
+ * address no screen had shown.)
+ *
+ * Signatures per approved transaction: at most one per action, each over
+ * the verified sighash. The count is reached -> the session ends. A host
+ * that needs fewer (it signs dummy spends itself) simply stops; the next
+ * TxMeta, PING or ABORT ends the transaction. */
 static HWP_NOINLINE void handle_sign_req(HwpDispatcher* d, HwpFrame* f,
                                           bool* user_confirmed,
                                           uint16_t* sign_req_seen) {
-    /* Parse into the dispatcher-embedded scratch: with the 255-byte
-     * recipient the struct no longer fits the per-function stack budget
-     * (see the field's note in hwp_dispatcher.h). */
+    /* Parse into the dispatcher-embedded scratch (the struct does not fit
+     * the per-function stack budget). */
     HwpSignReq* req = &d->sign_req;
     if(!hwp_parse_sign_req(f->payload, f->payload_len, req)) {
         send_error(d, f->seq, HWP_ERR_BAD_SIGHASH, "Invalid SIGN_REQ payload");
@@ -623,85 +673,34 @@ static HWP_NOINLINE void handle_sign_req(HwpDispatcher* d, HwpFrame* f,
         send_error(d, f->seq, HWP_ERR_INVALID_STATE,
                    "ZIP-244 verification not completed");
         return;
-    } else if(chk == SIGNER_ERR_WRONG_SIGHASH) {
+    } else if(chk != SIGNER_OK) {
+        /* A request for any other sighash ends the session: the approvals
+         * were for one transaction. */
         send_error(d, f->seq, HWP_ERR_SIGHASH_MISMATCH,
                    "SIGN_REQ sighash != verified sighash");
         return;
-    } else if(chk != SIGNER_OK) {
-        send_error(d, f->seq, HWP_ERR_INVALID_STATE, "Signer check failed");
+    }
+    if(*sign_req_seen >= d->signer->actions_received) {
+        /* Unreachable (the session is reset when the count is reached);
+         * kept as the bound's last line. */
+        send_error(d, f->seq, HWP_ERR_INVALID_STATE, "Signature limit reached");
         return;
     }
 
     if(!*user_confirmed) {
-        /* Decide address type + network from the recipient string.
-         *   "u"      → Orchard/shielded mainnet UA
-         *   "utest"  → Orchard/shielded testnet UA
-         *   "t1","t3"→ transparent P2PKH/P2SH mainnet (Zcash main params)
-         *   "tm","t2"→ transparent P2PKH/P2SH testnet
-         * Required for shielded → t-addr sweeps: the SIGN_REQ.recipient
-         * is the destination t-addr, not a UA, and the previous code
-         * (strncmp(... "utest", 5)) only recognized shielded testnet
-         * and rejected every transparent recipient as a network
-         * mismatch. The transparent digest the device already verified
-         * is what binds SIGN_REQ.recipient to the actual sent funds. */
-        const char* r = req->recipient;
-        bool is_shielded;
-        bool addr_is_testnet;
-        if(r[0] == 'u') {
-            is_shielded = true;
-            addr_is_testnet = (strncmp(r, "utest", 5) == 0);
-        } else if(r[0] == 't' &&
-                  (r[1] == '1' || r[1] == '3' || r[1] == 'm' || r[1] == '2')) {
-            is_shielded = false;
-            addr_is_testnet = (r[1] == 'm' || r[1] == '2');
-        } else {
-            send_error(d, f->seq, HWP_ERR_BAD_FRAME,
-                       "Unknown recipient address type");
+        /* The final prompt shows the device's own numbers and nothing
+         * else. */
+        OrchardSignerTotals totals;
+        OrchardSignerError terr = orchard_signer_get_totals(d->signer, &totals);
+        if(terr != SIGNER_OK) {
+            fail_signer(d, f->seq, terr);
             return;
-        }
-        if(addr_is_testnet != d->testnet) {
-            send_error(d, f->seq, HWP_ERR_NETWORK_MISMATCH,
-                       d->testnet ? "Mainnet addr on testnet signer"
-                                  : "Testnet addr on mainnet signer");
-            show_network_error(d, addr_is_testnet ? "Received TESTNET address"
-                                                  : "Received MAINNET address");
-            return;
-        }
-
-        /* Constant-time recipient binding: for shielded recipients the
-         * SIGN_REQ.recipient UA must encode an Orchard receiver that
-         * appears in one of the actions the user already confirmed in
-         * the per-output review loop. Closes the post-confirmation
-         * recipient-substitution attack. For transparent recipients
-         * there is no equivalent on-device check at this layer — the
-         * safety property is delegated to the transparent digest, which
-         * the device cross-verifies twice (against TxMeta and against
-         * the sentinel) before flipping `transparent_verified = true`.
-         * TODO: surface the transparent outputs in the per-output
-         * review so the user actually sees the destination t-addr
-         * before signing (requires preserving script_pubkey + a small
-         * base58check encoder on-device). */
-        if(is_shielded) {
-            uint8_t intended_recipient[43];
-            const char* hrp = d->testnet ? "utest" : "u";
-            int dec = orchard_decode_ua_orchard_receiver(
-                r, hrp, intended_recipient);
-            if(dec != 0 ||
-               !orchard_signer_recipient_matches_any(d->signer,
-                                                      intended_recipient)) {
-                send_error(d, f->seq, HWP_ERR_RECIPIENT_MISMATCH,
-                           "SIGN_REQ recipient does not match any confirmed action");
-                memzero(intended_recipient, sizeof(intended_recipient));
-                orchard_signer_reset(d->signer);
-                return;
-            }
-            memzero(intended_recipient, sizeof(intended_recipient));
         }
 
         phase(d, HWP_PHASE_AWAIT_CONFIRM, 0, d->signer->actions_received);
-        HwpUiResult uir = d->ui.confirm_tx(req->amount, req->fee, req->recipient,
-                                            d->user_ctx);
+        HwpUiResult uir = d->ui.confirm_tx(&totals, d->user_ctx);
         if(uir != HWP_UI_OK) {
+            /* A refusal ends the session: the host cannot simply ask again. */
             send_error(d, f->seq, HWP_ERR_USER_CANCELLED, "User cancelled");
             return;
         }
@@ -718,6 +717,7 @@ static HWP_NOINLINE void handle_sign_req(HwpDispatcher* d, HwpFrame* f,
     OrchardSignerError serr = orchard_signer_sign(
         d->signer, req->sighash, d->keys.ask, req->alpha, sig, rk);
     if(serr != SIGNER_OK) {
+        memzero(sig, sizeof(sig));
         send_error(d, f->seq, HWP_ERR_SIGN_FAILED, "RedPallas sign failed");
         return;
     }
@@ -726,15 +726,13 @@ static HWP_NOINLINE void handle_sign_req(HwpDispatcher* d, HwpFrame* f,
     memcpy(rsp, sig, 64);
     memcpy(rsp + 64, rk, 32);
     send_frame(d, f->seq, HWP_MSG_SIGN_RSP, rsp, 96);
+    memzero(sig, sizeof(sig));
+    memzero(rsp, sizeof(rsp));
 
     if(*sign_req_seen >= d->signer->actions_received) {
-        /* Last sig for this transaction. Show "Signature sent!" briefly
-         * so the user sees the confirmation, then reset everything so a
-         * follow-up tx from the SAME companion session starts clean
-         * (the signer state machine refuses feed_meta unless we're back
-         * in IDLE). The 2.5 s linger is long enough to read the
-         * confirmation but short enough that a user pressing the back
-         * button to start another tx isn't kept waiting. */
+        /* One signature per action has been given: the transaction is
+         * done. Show "Signature sent!" briefly, then reset everything so a
+         * follow-up tx from the same companion session starts clean. */
         phase(d, HWP_PHASE_DONE, *sign_req_seen, d->signer->actions_received);
         d->io.sleep_ms(2500, d->user_ctx);
         orchard_signer_reset(d->signer);
@@ -748,6 +746,14 @@ static HWP_NOINLINE void handle_sign_req(HwpDispatcher* d, HwpFrame* f,
 }
 
 /* ── Main loop ──────────────────────────────────────────────────────── */
+
+/* A handled frame may have carried a memo or a note plaintext; do not keep
+ * it in the RX buffer (or the SIGN_REQ scratch) until the next one happens
+ * to overwrite it. */
+static void wipe_frame(HwpDispatcher* d) {
+    memzero(&d->parser.frame, sizeof(d->parser.frame));
+    memzero(&d->sign_req, sizeof(d->sign_req));
+}
 
 /* CDC packet size; one drain call pulls at most this many bytes so that
  * after a complete frame the unread bytes of subsequent frames stay
@@ -777,11 +783,23 @@ static void feed_byte(ParseCtx* pc, uint8_t b) {
 }
 
 HwpDispatchResult hwp_dispatcher_run(HwpDispatcher* d) {
+    /* Everything the loop will dereference or call, checked once: a
+     * missing mandatory callback or key is a configuration error to report
+     * here, not a NULL dereference in the middle of a session. */
     if(!d || !d->signer || !d->io.serial_drain || !d->io.serial_send ||
        !d->io.get_tick_ms || !d->io.sleep_ms || !d->io.should_exit ||
-       !d->ui.review_output || !d->ui.confirm_tx) {
+       !d->ui.review_output || !d->ui.review_totals || !d->ui.confirm_tx ||
+       !d->keys.ak || !d->keys.nk || !d->keys.rivk || !d->keys.ask) {
         return HWP_DISP_FATAL;
     }
+    /* The network is the firmware's choice, made in orchard_signer_init();
+     * `testnet` (address prefixes on the screens) must say the same. */
+    if(d->signer->coin_type !=
+       (d->testnet ? ORCHARD_SIGNER_COIN_TESTNET : ORCHARD_SIGNER_COIN_MAINNET)) {
+        return HWP_DISP_FATAL;
+    }
+    /* Start from nothing, whatever the caller left in the context. */
+    orchard_signer_reset(d->signer);
 
     hwp_parser_init(&d->parser);
     ParseCtx pc = {.parser = &d->parser, .last_result = HWP_FEED_INCOMPLETE,
@@ -933,11 +951,29 @@ HwpDispatchResult hwp_dispatcher_run(HwpDispatcher* d) {
             break;
         }
 
+        /* The final confirmation belongs to one verified transaction. If
+         * the signer is no longer VERIFIED (the session was reset, or a new
+         * one has begun), it has to be asked again. */
+        if(d->signer->state != SIGNER_VERIFIED) {
+            user_confirmed = false;
+            sign_req_seen = 0;
+        }
+        wipe_frame(d);
+
         /* After handling a frame, the parser is "done" with it — reset
          * state so the next byte starts the next frame. */
         hwp_parser_init(&d->parser);
         pc.last_result = HWP_FEED_INCOMPLETE;
     }
 
+    /* Session over: the signer holds the incoming viewing keys of the
+     * transaction in flight — do not leave them behind. The same goes for
+     * the dispatcher's own buffers: the last frame sent (an FVK_RSP is the
+     * viewing key) and the last one received. */
+    orchard_signer_reset(d->signer);
+    memzero(d->tx_buf, sizeof(d->tx_buf));
+    memzero(&d->parser, sizeof(d->parser));
+    memzero(&d->sign_req, sizeof(d->sign_req));
+    memzero(&pc, sizeof(pc));
     return HWP_DISP_EXIT_REQUESTED;
 }

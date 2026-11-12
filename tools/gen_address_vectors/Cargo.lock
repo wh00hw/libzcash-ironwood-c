@@ -273,6 +273,7 @@ dependencies = [
  "hex",
  "orchard",
  "pasta_curves",
+ "sinsemilla",
  "zip32",
 ]
 

@@ -1,0 +1,18 @@
+[package]
+name = "gen_ztot_vector"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+# The NU7 release set (same versions as zcash-hw-wallet-sdk).
+[dependencies]
+pczt = { version = "=0.10.0", features = ["io-finalizer", "signer", "zcp-builder"] }
+orchard = "=0.16.0"
+zcash_primitives = "=0.31.0"
+zcash_protocol = "=0.11.0"
+zcash_transparent = "=0.11.0"
+incrementalmerkletree = "0.9"
+rand_core = "0.10"
+rand = { version = "0.10", default-features = false, features = ["sys_rng"] }
+hex = "0.4"

@@ -1,9 +1,8 @@
 /**
- * secp256k1 curve operations + ECDSA signing.
+ * secp256k1 curve operations (+ ECDSA signing, compiled out by default).
  *
  * Point arithmetic adapted from pallas.c (same short Weierstrass form with a=0).
- * ECDSA signing with RFC 6979 deterministic nonce (HMAC-SHA256).
- * All operations constant-time. No heap. No precomputed tables.
+ * NOT constant-time (see secp256k1.h). No heap. No precomputed tables.
  */
 #include "secp256k1.h"
 #include "bignum.h"
@@ -26,12 +25,15 @@ static const bignum256 s_n = {{
 }};
 
 /* n/2 for low-S normalization (BIP-62) */
+#if ZCASH_ENABLE_TRANSPARENT_SIGNING
 static const bignum256 s_half_n = {{
     0x081b20a0, 0x1f497a33, 0x09140777, 0x0edce6af,
     0x1ffff5d5, 0x1fffffff, 0x1fffffff, 0x1fffffff, 0x007fffff
 }};
 
 /* Generator G */
+#endif
+
 static const bignum256 s_Gx = {{
     0x16f81798, 0x0f940ad8, 0x138a3656, 0x17f9b65b,
     0x10b07029, 0x114ae743, 0x0eb15681, 0x0fdf3b97, 0x0079be66
@@ -54,8 +56,17 @@ static void sfp_add(bignum256 *r, const bignum256 *a, const bignum256 *b) {
 static void sfp_sub(bignum256 *r, const bignum256 *a, const bignum256 *b) {
     bn_subtractmod(a, b, r, &s_p); bn_fast_mod(r, &s_p); bn_mod(r, &s_p);
 }
+/* r may alias a and/or b. (Until November 2026 this was
+ * `bn_copy(a, r); bn_multiply(b, r, p)`, which computes a*a when r == b —
+ * the case `sfp_mul(&y3, &rr, &y3)` of the mixed addition, and the
+ * corresponding line of the doubling. Every point with an addition in its
+ * ladder was wrong: see tests/test_secp256k1.c.) */
 static void sfp_mul(bignum256 *r, const bignum256 *a, const bignum256 *b) {
-    bn_copy(a, r); bn_multiply(b, r, &s_p);
+    bignum256 t;
+    bn_copy(a, &t);
+    bn_multiply(b, &t, &s_p);
+    bn_copy(&t, r);
+    memzero(&t, sizeof(t));
 }
 static void sfp_sqr(bignum256 *r, const bignum256 *a) {
     bn_copy(a, r); bn_multiply(a, r, &s_p);
@@ -195,7 +206,10 @@ void secp256k1_jac_add_mixed(secp256k1_jac *r, const secp256k1_jac *j, const sec
     memzero(&x3, sizeof(x3)); memzero(&y3, sizeof(y3)); memzero(&z3, sizeof(z3));
 }
 
-/* Constant-time Montgomery ladder: r = k * p */
+/* Montgomery ladder: r = k * p. The register swap is masked, but the ladder
+ * as a whole is NOT constant-time in k: secp256k1_from_jac() (an inversion,
+ * skipped when Z == 0) runs at every bit, and jac_add_mixed / jac_double
+ * take early exits on the point at infinity. See the note in secp256k1.h. */
 void secp256k1_point_mul(secp256k1_point *r, const bignum256 *k, const secp256k1_point *p) {
     static secp256k1_jac R0, R1, jtmp;
     static secp256k1_point R0_affine;
@@ -272,6 +286,10 @@ int secp256k1_get_public_key33(const uint8_t sk[32], uint8_t pubkey[33]) {
     memzero(&Q, sizeof(Q));
     return 0;
 }
+
+#if ZCASH_ENABLE_TRANSPARENT_SIGNING
+/* Everything below is compiled out by default: see
+ * ZCASH_ENABLE_TRANSPARENT_SIGNING in options.h. */
 
 /* ── RFC 6979 deterministic nonce (HMAC-SHA256) ──────────────────── */
 
@@ -455,3 +473,5 @@ size_t secp256k1_sig_to_der(const uint8_t compact[64], uint8_t *der_out) {
 
     return (size_t)pos;
 }
+
+#endif /* ZCASH_ENABLE_TRANSPARENT_SIGNING */

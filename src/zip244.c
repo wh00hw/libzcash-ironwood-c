@@ -19,10 +19,9 @@ static const char PERSONAL_TRANSPARENT[] = "ZTxIdTranspaHash";
 static const char PERSONAL_PREVOUTS[]    = "ZTxIdPrevoutHash";
 static const char PERSONAL_SEQUENCES[]   = "ZTxIdSequencHash";
 static const char PERSONAL_OUTPUTS[]     = "ZTxIdOutputsHash";
-/* Per-input transparent sig digest personalizations (ZIP-244 S.2) */
-static const char PERSONAL_AMOUNTS[]     = "ZTxTrAmountsHash";
-static const char PERSONAL_SCRIPTS[]     = "ZTxTrScriptsHash";
-static const char PERSONAL_TXIN_SIG[]    = "Zcash___TxInHash";
+/* The per-input signature digest of ZIP-244 S.2 ("ZTxTrAmountsHash",
+ * "ZTxTrScriptsHash", "Zcash___TxInHash") is not implemented: transparent
+ * inputs are not supported. */
 
 static const char PERSONAL_ORCHARD[]    = "ZTxIdOrchardHash";
 static const char PERSONAL_COMPACT[]    = "ZTxIdOrcActCHash";
@@ -83,62 +82,13 @@ static size_t write_compact_size(uint8_t* buf, uint64_t val) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Transparent txid digest (incremental)                             */
+/*  Transparent digest, outputs only (no transparent inputs)          */
 /* ------------------------------------------------------------------ */
 
 void zip244_transparent_init(Zip244TransparentState *state) {
     memset(state, 0, sizeof(*state));
-    blake2b_InitPersonal(&state->prevouts_ctx,  32, PERSONAL_PREVOUTS,  16);
-    blake2b_InitPersonal(&state->sequence_ctx,  32, PERSONAL_SEQUENCES, 16);
-    blake2b_InitPersonal(&state->outputs_ctx,   32, PERSONAL_OUTPUTS,   16);
-    blake2b_InitPersonal(&state->amounts_ctx,   32, PERSONAL_AMOUNTS,   16);
-    blake2b_InitPersonal(&state->scripts_ctx,   32, PERSONAL_SCRIPTS,   16);
-    state->inputs_received = 0;
-    state->outputs_received = 0;
+    blake2b_InitPersonal(&state->outputs_ctx, 32, PERSONAL_OUTPUTS, 16);
     state->initialized = true;
-}
-
-bool zip244_hash_transparent_input(Zip244TransparentState *state,
-                                   const uint8_t *data, size_t data_len) {
-    if (!state->initialized) return false;
-
-    /* Wire format: prevout_hash[32] || prevout_index[4 LE] || sequence[4 LE] ||
-     *              value[8 LE] || script_pubkey_len[2 LE] || script_pubkey[N]
-     * Minimum size: 32 + 4 + 4 + 8 = 48 (+ optional script fields) */
-    if (data_len < 48) return false;
-
-    /* prevouts_digest: prevout_hash[32] || prevout_index[4 LE] */
-    blake2b_Update(&state->prevouts_ctx, data, 36);
-
-    /* sequence_digest: sequence[4 LE] */
-    blake2b_Update(&state->sequence_ctx, data + 36, 4);
-
-    /* amounts_digest: value[8 LE] (as i64, same bytes for non-negative) */
-    blake2b_Update(&state->amounts_ctx, data + 40, 8);
-
-    /* Accumulate the per-input value into the running total used for
-     * on-device fee computation. Negative values are nonsensical for a
-     * Bitcoin/Zcash UTXO input; treat the wire bytes as unsigned and
-     * flag overflow so the signer surfaces an error rather than wrapping. */
-    uint64_t v = 0;
-    for (int i = 7; i >= 0; i--) v = (v << 8) | data[40 + i];
-    uint64_t new_total = state->t_in_total + v;
-    if (new_total < state->t_in_total) state->t_in_overflow = true;
-    state->t_in_total = new_total;
-
-    /* scripts_digest: CompactSize(script_len) || script_pubkey
-     * Wire format has script_pubkey_len as 2-byte LE at offset 48 */
-    uint16_t script_len = (uint16_t)data[48] | ((uint16_t)data[49] << 8);
-    const uint8_t *script = data + 50;
-    uint8_t cs_buf[5];
-    size_t cs_len = write_compact_size(cs_buf, script_len);
-    blake2b_Update(&state->scripts_ctx, cs_buf, cs_len);
-    if (script_len > 0 && data_len >= (size_t)(50 + script_len)) {
-        blake2b_Update(&state->scripts_ctx, script, script_len);
-    }
-
-    state->inputs_received++;
-    return true;
 }
 
 bool zip244_hash_transparent_output(Zip244TransparentState *state,
@@ -146,14 +96,15 @@ bool zip244_hash_transparent_output(Zip244TransparentState *state,
     if (!state->initialized) return false;
 
     /* Wire format: value[8 LE] || script_pubkey_len[2 LE] || script_pubkey[N]
-     * Minimum size: 8 + 2 = 10 */
+     * The length must be exact: nothing is read past data_len and no
+     * trailing byte is ignored. */
     if (data_len < 10) return false;
 
     const uint8_t *value = data;
     uint16_t script_len = (uint16_t)data[8] | ((uint16_t)data[9] << 8);
     const uint8_t *script = data + 10;
 
-    if (data_len < (size_t)(10 + script_len)) return false;
+    if (data_len != (size_t)10 + script_len) return false;
 
     /* outputs_digest matches TxOut::write():
      *   value[8 LE] || CompactSize(script_len) || script_pubkey */
@@ -164,8 +115,8 @@ bool zip244_hash_transparent_output(Zip244TransparentState *state,
     blake2b_Update(&state->outputs_ctx, cs_buf, cs_len);
     blake2b_Update(&state->outputs_ctx, script, script_len);
 
-    /* Accumulate output value for on-device fee computation (see notes
-     * on zip244_hash_transparent_input). */
+    /* Accumulate the output value for the on-device fee computation;
+     * flag overflow so the signer reports an error rather than wrapping. */
     uint64_t v = 0;
     for (int i = 7; i >= 0; i--) v = (v << 8) | value[i];
     uint64_t new_total = state->t_out_total + v;
@@ -178,86 +129,26 @@ bool zip244_hash_transparent_output(Zip244TransparentState *state,
 
 void zip244_transparent_digest(Zip244TransparentState *state,
                                uint8_t digest_out[32]) {
-    /* Finalize sub-digests */
+    /* No inputs (never supported here) and no outputs: the bundle is
+     * absent and the leaf is the hash of nothing. */
+    if (!state->initialized || state->outputs_received == 0) {
+        zip244_empty_digest(PERSONAL_TRANSPARENT, digest_out);
+        return;
+    }
+
+    /* vin is empty: prevouts_digest and sequence_digest are the hashes of
+     * nothing under their personalizations (ZIP 244 T.2a / T.2b). */
     uint8_t prevouts_digest[32], sequence_digest[32], outputs_digest[32];
+    zip244_empty_digest(PERSONAL_PREVOUTS, prevouts_digest);
+    zip244_empty_digest(PERSONAL_SEQUENCES, sequence_digest);
+    blake2b_Final(&state->outputs_ctx, outputs_digest, 32);
 
-    blake2b_Final(&state->prevouts_ctx,  prevouts_digest,  32);
-    blake2b_Final(&state->sequence_ctx,  sequence_digest,  32);
-    blake2b_Final(&state->outputs_ctx,   outputs_digest,   32);
-
-    /* Combine: BLAKE2b-256("ZTxIdTranspaHash",
-     *     prevouts_digest || sequence_digest || outputs_digest) */
     blake2b_state root;
     blake2b_InitPersonal(&root, 32, PERSONAL_TRANSPARENT, 16);
     blake2b_Update(&root, prevouts_digest, 32);
     blake2b_Update(&root, sequence_digest, 32);
     blake2b_Update(&root, outputs_digest,  32);
     blake2b_Final(&root, digest_out, 32);
-}
-
-void zip244_transparent_per_input_sighash(
-    Zip244TransparentState *state,
-    uint16_t input_index,
-    const uint8_t *input_data,
-    size_t input_data_len,
-    uint8_t hash_type,
-    uint8_t sighash_out[32])
-{
-    (void)input_index; /* reserved for future per-input disambiguation */
-
-    /* Static storage to stay within embedded stack budget.
-     * Same pattern as pallas_point_mul / pallas_jac_double. */
-    static blake2b_state s_ctx;
-    static uint8_t s_digests[7][32]; /* prevouts, sequence, outputs, amounts, scripts, txin_sig, (spare) */
-
-    /* Finalize sub-digests (copy contexts to avoid consuming them) */
-    s_ctx = state->prevouts_ctx;  blake2b_Final(&s_ctx, s_digests[0], 32);
-    s_ctx = state->sequence_ctx;  blake2b_Final(&s_ctx, s_digests[1], 32);
-    s_ctx = state->outputs_ctx;   blake2b_Final(&s_ctx, s_digests[2], 32);
-    s_ctx = state->amounts_ctx;   blake2b_Final(&s_ctx, s_digests[3], 32);
-    s_ctx = state->scripts_ctx;   blake2b_Final(&s_ctx, s_digests[4], 32);
-
-    /* txin_sig_digest = BLAKE2b-256("Zcash___TxInHash",
-     *     prevout_hash[32] || prevout_index[4 LE] || value[8 LE signed] ||
-     *     CompactSize(script_len) || script_pubkey || sequence[4 LE])
-     *
-     * Wire format of input_data:
-     *   prevout_hash[32] || prevout_index[4] || sequence[4] ||
-     *   value[8] || script_pubkey_len[2 LE] || script_pubkey[N]
-     */
-    blake2b_InitPersonal(&s_ctx, 32, PERSONAL_TXIN_SIG, 16);
-
-    if (input_data_len >= 50) {
-        blake2b_Update(&s_ctx, input_data, 36);           /* prevout */
-        blake2b_Update(&s_ctx, input_data + 40, 8);       /* value */
-
-        uint16_t script_len = (uint16_t)input_data[48] | ((uint16_t)input_data[49] << 8);
-        uint8_t cs_buf[5];
-        size_t cs_len = write_compact_size(cs_buf, script_len);
-        blake2b_Update(&s_ctx, cs_buf, cs_len);
-        if (script_len > 0 && input_data_len >= (size_t)(50 + script_len)) {
-            blake2b_Update(&s_ctx, input_data + 50, script_len);
-        }
-
-        blake2b_Update(&s_ctx, input_data + 36, 4);       /* sequence */
-    }
-
-    blake2b_Final(&s_ctx, s_digests[5], 32);               /* txin_sig_digest */
-
-    /* transparent_sig_digest = BLAKE2b-256("ZTxIdTranspaHash",
-     *     hash_type[1] || prevouts || amounts || scripts ||
-     *     sequence || outputs || txin_sig) */
-    blake2b_InitPersonal(&s_ctx, 32, PERSONAL_TRANSPARENT, 16);
-    blake2b_Update(&s_ctx, &hash_type, 1);
-    blake2b_Update(&s_ctx, s_digests[0], 32);  /* prevouts */
-    blake2b_Update(&s_ctx, s_digests[3], 32);  /* amounts */
-    blake2b_Update(&s_ctx, s_digests[4], 32);  /* scripts */
-    blake2b_Update(&s_ctx, s_digests[1], 32);  /* sequence */
-    blake2b_Update(&s_ctx, s_digests[2], 32);  /* outputs */
-    blake2b_Update(&s_ctx, s_digests[5], 32);  /* txin_sig */
-    blake2b_Final(&s_ctx, sighash_out, 32);
-
-    memzero(s_digests, sizeof(s_digests));
 }
 
 /* ------------------------------------------------------------------ */
@@ -511,7 +402,11 @@ void zip244_shielded_sighash_v6(const Zip244TxMeta* meta,
     const uint8_t *sapling_digest = meta->sapling_digest;
 
     /* 4. Orchard (sealed pool) digest — empty-bundle constant when the
-     *    transaction carries no Orchard actions. No anchor under v6. */
+     *    transaction carries no Orchard actions. No anchor under v6.
+     *    NOTE: in the empty case meta->orchard_flags and
+     *    meta->value_balance are NOT hashed (there is no bundle on chain to
+     *    carry them). orchard_signer refuses a non-zero value balance for a
+     *    pool without actions before it gets here. */
     uint8_t orchard_digest_val[32];
     if (orchard_state != NULL && orchard_state->actions_hashed > 0) {
         zip244_bundle_digest(orchard_state, meta->orchard_flags,
@@ -521,7 +416,7 @@ void zip244_shielded_sighash_v6(const Zip244TxMeta* meta,
         zip244_pool_empty_digest(ZIP244_POOL_ORCHARD, true, orchard_digest_val);
     }
 
-    /* 5. Ironwood digest — empty-bundle constant when absent. */
+    /* 5. Ironwood digest — empty-bundle constant when absent (same note). */
     uint8_t ironwood_digest_val[32];
     if (ironwood_state != NULL && ironwood_state->actions_hashed > 0) {
         zip244_bundle_digest(ironwood_state, meta->ironwood_flags,

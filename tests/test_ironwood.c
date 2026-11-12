@@ -316,10 +316,17 @@ static void test_v6_sighash_full_signer(void) {
     size_t meta_len = zip244_encode_tx_meta(meta_wire, &meta);
     assert(meta_len == ZIP244_TX_META_V6_EXT_SIZE);
 
-    static OrchardSignerCtx ctx;
-    orchard_signer_init(&ctx);
+    /* Any full viewing key will do here: this test is about the sighash,
+     * and k_recipient belongs to nobody in particular (EXTERNAL). */
+    static const uint8_t fvk_ak[32] = {[0 ... 31] = 0x10};
+    static const uint8_t fvk_nk[32] = {[0 ... 31] = 0x20};
+    static const uint8_t fvk_rivk[32] = {[0 ... 31] = 0x30};
+    const OrchardSignerFvk fvk = {.ak = fvk_ak, .nk = fvk_nk, .rivk = fvk_rivk};
 
-    assert(orchard_signer_feed_meta(&ctx, meta_wire, meta_len, 1) == SIGNER_OK);
+    static OrchardSignerCtx ctx;
+    orchard_signer_init(&ctx, 133);
+
+    assert(orchard_signer_feed_meta(&ctx, &fvk, meta_wire, meta_len, 1) == SIGNER_OK);
     assert(ctx.tx_meta.is_v6);
 
     assert(orchard_signer_feed_action_with_note_and_memo(
@@ -328,10 +335,12 @@ static void test_v6_sighash_full_signer(void) {
 
     /* No-blind-signing invariants: confirm the output and the fee. */
     assert(orchard_signer_confirm_action(&ctx, 0) == SIGNER_OK);
-    uint64_t fee = 0;
-    assert(orchard_signer_get_fee(&ctx, &fee) == SIGNER_OK);
+    OrchardSignerTotals totals;
+    assert(orchard_signer_get_totals(&ctx, &totals) == SIGNER_OK);
+    uint64_t fee = totals.fee;
     assert(fee == 10000);
-    assert(orchard_signer_confirm_fee(&ctx) == SIGNER_OK);
+    assert(totals.total_leaving == k_value + 10000);
+    assert(orchard_signer_confirm_totals(&ctx) == SIGNER_OK);
 
     /* verify() recomputes the whole v6 sighash and must accept the
      * zcash_primitives-produced value... */
@@ -340,19 +349,116 @@ static void test_v6_sighash_full_signer(void) {
            (unsigned long long)fee);
 
     /* ...and a flipped-bit sighash must be rejected. */
-    orchard_signer_init(&ctx);
-    assert(orchard_signer_feed_meta(&ctx, meta_wire, meta_len, 1) == SIGNER_OK);
+    orchard_signer_init(&ctx, 133);
+    assert(orchard_signer_feed_meta(&ctx, &fvk, meta_wire, meta_len, 1) == SIGNER_OK);
     assert(orchard_signer_feed_action_with_note_and_memo(
                &ctx, ZIP244_POOL_IRONWOOD, action, sizeof(action),
                k_recipient, k_value, k_rseed, memo) == SIGNER_OK);
     assert(orchard_signer_confirm_action(&ctx, 0) == SIGNER_OK);
-    assert(orchard_signer_get_fee(&ctx, &fee) == SIGNER_OK);
-    assert(orchard_signer_confirm_fee(&ctx) == SIGNER_OK);
+    assert(orchard_signer_get_totals(&ctx, &totals) == SIGNER_OK);
+    assert(orchard_signer_confirm_totals(&ctx) == SIGNER_OK);
     uint8_t bad[32];
     memcpy(bad, k_v6tx_expected_sighash, 32);
     bad[0] ^= 0x01;
     assert(orchard_signer_verify(&ctx, bad) == SIGNER_ERR_SIGHASH_MISMATCH);
     printf("PASS: v6 sighash mismatch rejected\n");
+}
+
+/* ── Shielded -> transparent, against the crates ─────────────────────
+ * tests/test_ztot_vector.h is a transaction built by zcash_primitives'
+ * Builder (tools/gen_ztot_vector): an Ironwood spend, a transparent P2PKH
+ * output, Ironwood change and the builder's dummy output. The sighash is the
+ * pczt Signer role's. The device must arrive at the same value from the
+ * streamed data — which checks the transparent leaf for "outputs, no
+ * inputs" — and must accept the dummy output with its 512 zero bytes of
+ * memo through the mandatory ciphertext check. */
+#include "test_ztot_vector.h"
+
+static void test_ztot_crate_vector(void) {
+    Zip244TxMeta meta;
+    memset(&meta, 0, sizeof(meta));
+    meta.version = ZTOT_VERSION;
+    meta.version_group_id = ZTOT_VERSION_GROUP_ID;
+    meta.consensus_branch_id = ZTOT_BRANCH_ID;
+    meta.lock_time = ZTOT_LOCK_TIME;
+    meta.expiry_height = ZTOT_EXPIRY_HEIGHT;
+    meta.orchard_flags = ZTOT_ORCHARD_FLAGS;   /* absent bundle: as the PCZT has it */
+    meta.value_balance = 0;
+    meta.ironwood_flags = ZTOT_IRONWOOD_FLAGS;
+    meta.ironwood_value_balance = ZTOT_IRONWOOD_VALUE_BALANCE;
+    meta.coin_type = ZTOT_COIN_TYPE;
+    zip244_sapling_empty_digest(meta.sapling_digest);
+    assert(ZTOT_ORCHARD_ACTIONS == 0);
+
+    /* transparent output: value[8] || len[2] || script */
+    uint8_t t_out[10 + sizeof(ZTOT_T_OUT_SCRIPT)];
+    for(int i = 0; i < 8; i++) t_out[i] = (uint8_t)(ZTOT_T_OUT_VALUE >> (8 * i));
+    t_out[8] = (uint8_t)sizeof(ZTOT_T_OUT_SCRIPT);
+    t_out[9] = 0;
+    memcpy(t_out + 10, ZTOT_T_OUT_SCRIPT, sizeof(ZTOT_T_OUT_SCRIPT));
+    Zip244TransparentState ts;
+    uint8_t t_digest[32];
+    zip244_transparent_init(&ts);
+    assert(zip244_hash_transparent_output(&ts, t_out, sizeof(t_out)));
+    zip244_transparent_digest(&ts, t_digest);
+    memcpy(meta.transparent_sig_digest, t_digest, 32);
+
+    uint8_t wire[ZIP244_TX_META_V6_EXT_SIZE];
+    assert(zip244_encode_tx_meta(wire, &meta) == sizeof(wire));
+
+    static OrchardSignerCtx ctx;
+    OrchardSignerFvk fvk = {.ak = ZTOT_AK, .nk = ZTOT_NK, .rivk = ZTOT_RIVK};
+    orchard_signer_init(&ctx, ZTOT_COIN_TYPE);
+    assert(orchard_signer_feed_meta(&ctx, &fvk, wire, sizeof(wire), ZTOT_N_ACTIONS) == SIGNER_OK);
+    assert(orchard_signer_begin_transparent(&ctx, 0, 1) == SIGNER_OK);
+    assert(orchard_signer_feed_transparent_output(&ctx, t_out, sizeof(t_out)) == SIGNER_OK);
+    assert(orchard_signer_verify_transparent(&ctx, t_digest) == SIGNER_OK);
+
+    int n_change = 0, n_dummy = 0;
+    for(int i = 0; i < ZTOT_N_ACTIONS; i++) {
+        const uint8_t* a = ZTOT_ACTIONS[i];
+        uint64_t value = 0;
+        for(int b = 7; b >= 0; b--) value = (value << 8) | a[820 + 43 + b];
+        /* What an honest host knows: the change it built has the ZIP 302
+         * "no memo"; the builder's dummy has 512 zero bytes. */
+        uint8_t memo[512];
+        memset(memo, 0, sizeof(memo));
+        if(value != 0) memo[0] = 0xF6;
+        assert(orchard_signer_feed_action_with_note_and_memo(
+                   &ctx, ZIP244_POOL_IRONWOOD, a, 820, a + 820, value, a + 820 + 43 + 8,
+                   memo) == SIGNER_OK);
+        OrchardOutputInfo info;
+        assert(orchard_signer_get_output(&ctx, (uint16_t)i, &info) == SIGNER_OK);
+        assert(info.memo == ORCHARD_MEMO_NONE && info.ciphertext_verified);
+        if(value != 0) {
+            assert(value == ZTOT_CHANGE_VALUE);
+            assert(info.ownership == ORCHARD_OUTPUT_OWN_INTERNAL && info.review_required);
+            assert(orchard_signer_confirm_action(&ctx, (uint16_t)i) == SIGNER_OK);
+            n_change++;
+        } else {
+            assert(info.ownership == ORCHARD_OUTPUT_EXTERNAL && !info.review_required);
+            n_dummy++;
+        }
+    }
+    assert(n_change == 1 && n_dummy == 1);
+
+    OrchardSignerTotals t;
+    assert(orchard_signer_get_totals(&ctx, &t) == SIGNER_OK);
+    assert(t.fee == ZTOT_FEE && t.transparent_out == ZTOT_T_OUT_VALUE);
+    assert(t.total_leaving == ZTOT_T_OUT_VALUE + ZTOT_FEE && t.own_internal == ZTOT_CHANGE_VALUE);
+    assert(orchard_signer_confirm_totals(&ctx) == SIGNER_OK);
+
+    /* The crate's sighash, and nothing else, is accepted. */
+    uint8_t wrong[32];
+    memcpy(wrong, ZTOT_SIGHASH, 32);
+    wrong[31] ^= 1;
+    OrchardSignerCtx saved = ctx;
+    assert(orchard_signer_verify(&ctx, wrong) == SIGNER_ERR_SIGHASH_MISMATCH);
+    ctx = saved;
+    assert(orchard_signer_verify(&ctx, ZTOT_SIGHASH) == SIGNER_OK);
+    assert(ctx.state == SIGNER_VERIFIED);
+    orchard_signer_reset(&ctx);
+    printf("  PASS: z->t transaction built by zcash_primitives 0.31: device sighash == crate sighash\n");
 }
 
 int main(void) {
@@ -363,5 +469,6 @@ int main(void) {
     test_v6_sighash_zip244();
     test_v6_sighash_full_signer();
     printf("All Ironwood cross-validation tests passed.\n");
+    test_ztot_crate_vector();
     return 0;
 }

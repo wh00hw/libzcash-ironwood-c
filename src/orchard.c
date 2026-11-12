@@ -229,6 +229,130 @@ void orchard_derive_account_sk(
 }
 
 // ============================================================
+// Incoming viewing keys and address ownership
+// ============================================================
+
+void orchard_derive_rivk_internal(
+    const uint8_t ak[32],
+    const uint8_t nk[32],
+    const uint8_t rivk[32],
+    uint8_t rivk_internal_out[32]) {
+    // PRF^expand(rivk, [0x83] || ak || nk), ak in its FVK encoding (sign
+    // bit clear) — orchard crate keys.rs, FullViewingKey::rivk(Internal).
+    uint8_t in[1 + 32 + 32];
+    uint8_t prf_out[64];
+    in[0] = 0x83;
+    memcpy(in + 1, ak, 32);
+    in[32] &= 0x7F;
+    memcpy(in + 33, nk, 32);
+    prf_expand(rivk, in, sizeof(in), prf_out);
+    to_scalar(prf_out, rivk_internal_out);
+    memzero(prf_out, sizeof(prf_out));
+    memzero(in, sizeof(in));
+}
+
+int orchard_commit_ivk(
+    const uint8_t ak[32],
+    const uint8_t nk[32],
+    const uint8_t rivk[32],
+    uint8_t ivk_out[32]) {
+    // 136 bytes of stack scratch, wiped below. Deliberately not `static`:
+    // on Flipper Zero .bss is heap, and this frame sits no deeper than
+    // orchard_compute_cmx()'s, which is larger.
+    uint8_t msg[64];
+    bignum256 rivk_bn, ivk_bn;
+
+    pallas_init();
+
+    // M = I2LEBSP_255(ak) || I2LEBSP_255(nk), LSB-first, 510 bits. nk goes
+    // in at bit 255 = byte 31, bit 7; packed with shifts, no branch on a
+    // key bit.
+    memcpy(msg, ak, 32);
+    msg[31] &= 0x7F;
+    memzero(msg + 32, 32);
+    for(int k = 0; k < 32; k++) {
+        uint8_t b = (k == 31) ? (uint8_t)(nk[k] & 0x7F) : nk[k];
+        msg[31 + k] |= (uint8_t)(b << 7);
+        msg[32 + k] |= (uint8_t)(b >> 1);
+    }
+
+    bn_read_le(rivk, &rivk_bn);
+    sinsemilla_short_commit(&ivk_bn, "z.cash:Orchard-CommitIvk", msg, 510, &rivk_bn);
+    // The x-coordinate is below p < q, so it is already the scalar ivk.
+    bn_write_le(&ivk_bn, ivk_out);
+
+    // Commit^ivk outputs [1, q_P) or bottom; the identity is extracted as 0.
+    uint8_t acc = 0;
+    for(int i = 0; i < 32; i++) acc |= ivk_out[i];
+
+    memzero(msg, sizeof(msg));
+    memzero(&rivk_bn, sizeof(rivk_bn));
+    memzero(&ivk_bn, sizeof(ivk_bn));
+    return acc ? 0 : -1;
+}
+
+int orchard_derive_ivks(
+    const uint8_t ak[32],
+    const uint8_t nk[32],
+    const uint8_t rivk[32],
+    uint8_t ivk_external_out[32],
+    uint8_t ivk_internal_out[32]) {
+    uint8_t rivk_internal[32];
+    int rc = orchard_commit_ivk(ak, nk, rivk, ivk_external_out);
+    orchard_derive_rivk_internal(ak, nk, rivk, rivk_internal);
+    rc |= orchard_commit_ivk(ak, nk, rivk_internal, ivk_internal_out);
+    memzero(rivk_internal, sizeof(rivk_internal));
+    if(rc != 0) {
+        memzero(ivk_external_out, 32);
+        memzero(ivk_internal_out, 32);
+        return -1;
+    }
+    return 0;
+}
+
+// repr_P([ivk] * DiversifyHash(d)) into out; returns 1 if the result is a
+// usable (non-identity) point. Everything that depends on ivk is wiped.
+static int ivk_pk_d(const uint8_t ivk[32], const uint8_t d[11], uint8_t out[32]) {
+    // Stack scratch (about 190 bytes), wiped below; see orchard_commit_ivk().
+    pallas_point g_d, q;
+    bignum256 k;
+
+    pallas_init();
+    orchard_diversify_hash(&g_d, d); // public; cached per diversifier
+    bn_read_le(ivk, &k);
+    pallas_point_mul(&q, &k, &g_d);
+
+    // Branch-free repr_P: the parity of y must not steer a jump here, the
+    // point is ivk-dependent until it has been compared.
+    bn_write_le(&q.x, out);
+    out[31] = (uint8_t)((out[31] & 0x7Fu) | ((q.y.val[0] & 1u) << 7));
+    int ok = (g_d.infinity == 0) & (q.infinity == 0);
+
+    memzero(&k, sizeof(k));
+    memzero(&q, sizeof(q));
+    memzero(&g_d, sizeof(g_d));
+    return ok;
+}
+
+void orchard_ivk_derive_pk_d(
+    const uint8_t ivk[32],
+    const uint8_t d[11],
+    uint8_t pk_d_out[32]) {
+    (void)ivk_pk_d(ivk, d, pk_d_out);
+}
+
+int orchard_ivk_owns_address(
+    const uint8_t ivk[32],
+    const uint8_t d[11],
+    const uint8_t pk_d[32]) {
+    uint8_t mine[32];
+    int ok = ivk_pk_d(ivk, d, mine);
+    int eq = ct_memequal(mine, pk_d, 32);
+    memzero(mine, sizeof(mine));
+    return ok & eq;
+}
+
+// ============================================================
 // FF1-AES-256 (NIST SP 800-38G) for diversifier derivation
 // Radix 2, n=88 bits, empty tweak
 // Matches the fpe crate's BinaryNumeralString behavior exactly.
@@ -1195,7 +1319,7 @@ int orchard_compute_enc_ciphertext(
 {
     /* Static-storage locals to stay within the embedded 512 B per-function
      * stack budget (audit: scripts/check_stack.sh). Same pattern as
-     * orchard_compute_cmx() and zip244_transparent_per_input_sighash().
+     * orchard_compute_cmx().
      * The signer state machine is single-threaded per call so re-entrancy
      * is a non-issue; every secret byte is memzero'd before return. */
     static pallas_point g_d;

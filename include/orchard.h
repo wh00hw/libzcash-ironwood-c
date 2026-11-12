@@ -94,14 +94,90 @@ int orchard_derive_unified_address_legacy(
     uint8_t* d_out,
     uint8_t* pk_d_out);
 
+/* ------------------------------------------------------------------ */
+/*  Incoming viewing keys and address ownership                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * rivk_internal, the commitment randomness of the internal (change) full
+ * viewing key (ZIP 32, "Orchard internal key derivation"; orchard crate
+ * FullViewingKey::rivk(Scope::Internal)):
+ *
+ *   rivk_internal = ToScalar(PRF^expand(rivk, [0x83] || ak || nk))
+ *
+ * `ak` is taken in its full-viewing-key encoding, i.e. with the sign bit
+ * clear; bit 255 of the input is ignored, so an un-normalised encoding of
+ * the same point gives the same result. `nk` and `rivk` must be canonical.
+ */
+void orchard_derive_rivk_internal(
+    const uint8_t ak[32],
+    const uint8_t nk[32],
+    const uint8_t rivk[32],
+    uint8_t rivk_internal_out[32]);
+
+/**
+ * ivk = Commit^ivk_rivk(ak, nk)
+ *     = Extract_P(SinsemillaShortCommit_rivk("z.cash:Orchard-CommitIvk",
+ *                 I2LEBSP_255(ak) || I2LEBSP_255(nk)))
+ * (protocol spec 4.2.3 / 5.4.8.4). Pass `rivk` for the external ivk and
+ * orchard_derive_rivk_internal()'s output for the internal one.
+ *
+ * Returns 0 on success, -1 if the commitment is 0 / bottom (no valid key
+ * has this; ivk_out is zeroed). The blinding scalar goes through the
+ * constant-time fixed-base multiplication; the Sinsemilla table lookups are
+ * indexed by ak/nk, exactly as in address derivation (see SECURITY.md).
+ */
+int orchard_commit_ivk(
+    const uint8_t ak[32],
+    const uint8_t nk[32],
+    const uint8_t rivk[32],
+    uint8_t ivk_out[32]);
+
+/**
+ * Both incoming viewing keys of a full viewing key: the external one
+ * (receiving addresses) and the internal one (change). Returns 0 on
+ * success, -1 if either commitment is invalid (both outputs zeroed).
+ * The outputs are viewing-key material: wipe them when done.
+ */
+int orchard_derive_ivks(
+    const uint8_t ak[32],
+    const uint8_t nk[32],
+    const uint8_t rivk[32],
+    uint8_t ivk_external_out[32],
+    uint8_t ivk_internal_out[32]);
+
+/**
+ * pk_d = [ivk] * DiversifyHash(d): the transmission key of the address with
+ * diversifier `d` under `ivk`. Constant-time in ivk.
+ */
+void orchard_ivk_derive_pk_d(
+    const uint8_t ivk[32],
+    const uint8_t d[11],
+    uint8_t pk_d_out[32]);
+
+/**
+ * Does the address (d, pk_d) belong to `ivk`, i.e. is
+ * pk_d == repr_P([ivk] * DiversifyHash(d))?  Returns 1 if so, 0 otherwise.
+ *
+ * Constant-time with respect to ivk: one hash-to-curve of the public
+ * diversifier (served from the per-action cache when the note commitment
+ * of the same output was just recomputed), one variable-base scalar
+ * multiplication, a branch-free encoding and a constant-time compare. Only
+ * the returned bit depends on the key. A non-canonical or off-curve pk_d
+ * simply does not match.
+ */
+int orchard_ivk_owns_address(
+    const uint8_t ivk[32],
+    const uint8_t d[11],
+    const uint8_t pk_d[32]);
+
 /**
  * Encode a (d, pk_d) pair as an Orchard-only Unified Address (ZIP-316).
  *
  * Used by the on-device signer to render an arbitrary recipient (one
  * extracted from a PCZT, NOT necessarily belonging to the device's own
- * key) so the user can verify it on-screen before authorizing the
- * signature. This is the encoding step that closes the "blind signing"
- * gap together with on-device cmx verification.
+ * key) so the user can read it on-screen before authorizing the
+ * signature.
  *
  *   raw_ua = 0x03 || 43 || d || pk_d || hrp_padded_to_16
  *   ua = bech32m(hrp, F4Jumble(raw_ua))
@@ -123,9 +199,9 @@ int orchard_encode_ua_raw(
 /**
  * Decode a Unified Address bech32m string and extract its Orchard receiver.
  *
- * Used by the on-device signer to compare a companion-supplied "intended
- * recipient" UA against the recipients actually signed for, matching the
- * defence in `orchard_signer_recipient_matches_any()`.
+ * Not used by the signer or the dispatcher (the SIGN_REQ recipient string
+ * is ignored since November 2026); kept as the inverse of
+ * orchard_encode_ua_raw() for firmware that needs to parse an address.
  *
  * Steps (ZIP-316 §3):
  *   1. bech32m decode of `ua_str` (validates checksum and HRP charset);

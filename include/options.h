@@ -109,6 +109,22 @@
 #  endif
 #endif
 
+// Transparent (secp256k1 ECDSA) SIGNING. OFF by default, and nothing in
+// this library calls it: transparent inputs are not supported (README,
+// "Transparent inputs are not supported"). The code is kept behind this
+// switch — rather than deleted — only as the starting point for a future
+// implementation, because it is NOT fit for a device key as it stands:
+//   - secp256k1_point_mul() is variable-time in the ECDSA nonce (and in the
+//     secret key); a host that can request signatures and time the replies
+//     can recover the key with a lattice attack;
+//   - there is no correct ZIP 244 transparent signature hash to sign.
+// Defining this to 1 compiles secp256k1_ecdsa_sign_digest() and
+// secp256k1_sig_to_der() for experiments and known-answer tests. Do not
+// ship a firmware that signs with a wallet key through it.
+#ifndef ZCASH_ENABLE_TRANSPARENT_SIGNING
+#define ZCASH_ENABLE_TRANSPARENT_SIGNING 0
+#endif
+
 // backward compat: old Flipper flag maps to the generic one
 #ifdef USE_FLIPPER_HAL_RANDOM
 #  if USE_FLIPPER_HAL_RANDOM && !USE_PLATFORM_RNG
