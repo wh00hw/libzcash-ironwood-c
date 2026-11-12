@@ -1096,8 +1096,14 @@ void orchard_compute_cmx(
 {
     /* The 1086-bit Sinsemilla input doubles as our scratchpad: every
      * intermediate is written directly into it, so we avoid keeping
-     * separate repr/psi buffers alive on the stack. */
-    uint8_t msg[136];
+     * separate repr/psi buffers alive on the stack.
+     *
+     * Static storage (single-threaded signer, wiped before return, covered
+     * by tests/test_residue.c): on the stack it left this frame within a
+     * few bytes of the 512-byte budget, and on which side depended on the
+     * compiler version (496 B with GCC 16, 512 B with GCC 13.3, 544 B on
+     * the CI runner). */
+    static uint8_t msg[136];
     memzero(msg, sizeof(msg));
 
     /* bits 0..255 (bytes 0..31): repr_P(g_d) — written in place. */
