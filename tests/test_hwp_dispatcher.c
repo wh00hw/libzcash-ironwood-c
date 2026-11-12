@@ -1512,7 +1512,8 @@ static void test_atk_a5_transparent_outputs(void) {
         push_tx_output(s, 6, 1, 1, sighash, 32);
         d = build_wallet_dispatcher(s, &g_signer);
         r = run_session(s, &d);
-        assert(r.first_error == HWP_ERR_FEE_OVERFLOW && s->review_calls == 0);
+        /* each value is above the supply: refused where it enters */
+        assert(r.first_error == HWP_ERR_VALUE_OVERFLOW && s->review_calls == 0);
     }
     /* A4.33: a 25-byte script that is not P2PKH. Before: accepted at feed
      * time and only "unrenderable" at review. Now refused where it enters. */
@@ -1732,9 +1733,17 @@ static void test_atk_a4_table(void) {
         FxNote a = fx_note(to, 1, NULL, 1);
         FxNote b = fx_note(to, 1, NULL, 2);
         b.pool = ZIP244_POOL_ORCHARD;
-        static const int64_t vbs[2][2] = {{INT64_MAX, INT64_MAX}, {INT64_MIN, INT64_MAX}};
-        static const int want[2] = {HWP_ERR_FEE_OVERFLOW, HWP_ERR_FEE_NEGATIVE};
-        for(int k = 0; k < 2; k++) {
+        /* Beyond the supply: refused with the TxMeta. Within it: a fee
+         * above the supply, and a negative fee, are refused at the totals. */
+        static const int64_t vbs[4][2] = {
+            {INT64_MAX, INT64_MAX},
+            {INT64_MIN, INT64_MAX},
+            {2100000000000000ll, 2100000000000000ll},
+            {-2100000000000000ll, 1}};
+        static const int want[4] = {
+            HWP_ERR_VALUE_OVERFLOW, HWP_ERR_VALUE_OVERFLOW,
+            HWP_ERR_VALUE_OVERFLOW, HWP_ERR_FEE_NEGATIVE};
+        for(int k = 0; k < 4; k++) {
             s = fresh_stub();
             tx_begin(&g_tx, FX_BRANCH_NU6_3, 0);
             meta_set_vb(g_tx.meta, vbs[k][0], vbs[k][1]);

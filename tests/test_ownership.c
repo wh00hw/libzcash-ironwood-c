@@ -630,7 +630,92 @@ static void test_branch_allow_list(void) {
 
 /* ── totals arithmetic ─────────────────────────────────────────────── */
 
+/* The sealed-pool spend-paired dummy: the only output whose ciphertext
+ * may differ from the recomputed one. */
+static OrchardSignerError feed_tampered(OrchardSignerCtx* ctx, const FxNote* note, uint8_t tag,
+                                        int enc_off, int epk_off) {
+    uint8_t action[820];
+    fx_build_action(action, note, tag);
+    /* action layout: cv[32] nf[32] rk[32] cmx[32] epk[32] enc[580] out[80] */
+    if(enc_off >= 0) action[160 + enc_off] ^= 0x5A;
+    if(epk_off >= 0) action[128 + epk_off] ^= 0x01;
+    return orchard_signer_feed_action_with_note_and_memo(
+        ctx, note->pool, action, sizeof(action), note->recipient, note->value,
+        note->rseed, note->memo);
+}
+
+static void test_sealed_pool_spend_dummy(void) {
+    OrchardSignerCtx* ctx = &g_ctx;
+    uint8_t to[43], change[43], own[43];
+    fx_addr_foreign(to);
+    fx_addr_change(change);
+    fx_addr_own_default(own);
+
+    /* Accepted: sealed Orchard pool, value 0, own address (external or
+     * internal), expected epk, no memo, ciphertext not the recomputed one. */
+    const uint8_t* mine[2] = {own, change};
+    for(int w = 0; w < 2; w++) {
+        FxNote dmy = fx_note(mine[w], 0, NULL, (uint8_t)(60 + w));
+        dmy.pool = ZIP244_POOL_ORCHARD;
+        open_session(ctx, 1, 0);
+        assert(feed_tampered(ctx, &dmy, (uint8_t)(60 + w), 17, -1) == SIGNER_OK);
+        OrchardOutputInfo info = output(ctx, 0);
+        assert(info.value == 0 && !info.review_required && !info.ciphertext_verified);
+        assert(info.ownership != ORCHARD_OUTPUT_EXTERNAL && info.memo == ORCHARD_MEMO_NONE);
+        orchard_signer_reset(ctx);
+    }
+
+    /* Refused, one condition removed at a time. */
+    {
+        /* a foreign recipient */
+        FxNote x = fx_note(to, 0, NULL, 70);
+        x.pool = ZIP244_POOL_ORCHARD;
+        open_session(ctx, 1, 0);
+        assert(feed_tampered(ctx, &x, 70, 17, -1) == SIGNER_ERR_MEMO_MISMATCH);
+        assert_aborted(ctx);
+        /* the Ironwood pool */
+        FxNote y = fx_note(own, 0, NULL, 71);
+        open_session(ctx, 1, 0);
+        assert(feed_tampered(ctx, &y, 71, 17, -1) == SIGNER_ERR_MEMO_MISMATCH);
+        assert_aborted(ctx);
+        /* a value */
+        FxNote z = fx_note(own, 1, NULL, 72);
+        z.pool = ZIP244_POOL_ORCHARD;
+        open_session(ctx, 1, 0);
+        assert(feed_tampered(ctx, &z, 72, 17, -1) == SIGNER_ERR_MEMO_MISMATCH);
+        assert_aborted(ctx);
+        /* a different epk */
+        FxNote e = fx_note(own, 0, NULL, 73);
+        e.pool = ZIP244_POOL_ORCHARD;
+        open_session(ctx, 1, 0);
+        assert(feed_tampered(ctx, &e, 73, 17, 3) == SIGNER_ERR_MEMO_MISMATCH);
+        assert_aborted(ctx);
+        open_session(ctx, 1, 0);
+        assert(feed_tampered(ctx, &e, 73, -1, 3) == SIGNER_ERR_MEMO_MISMATCH);
+        assert_aborted(ctx);
+        /* a declared memo */
+        FxNote m = fx_note(own, 0, "hello", 74);
+        m.pool = ZIP244_POOL_ORCHARD;
+        open_session(ctx, 1, 0);
+        assert(feed_tampered(ctx, &m, 74, 17, -1) == SIGNER_ERR_MEMO_MISMATCH);
+        assert_aborted(ctx);
+    }
+
+    /* An untampered zero-value own output in the sealed pool is still an
+     * ordinary verified output. */
+    FxNote ok = fx_note(own, 0, NULL, 75);
+    ok.pool = ZIP244_POOL_ORCHARD;
+    open_session(ctx, 1, 0);
+    assert(feed_full(ctx, &ok, 75) == SIGNER_OK);
+    assert(output(ctx, 0).ciphertext_verified);
+    orchard_signer_reset(ctx);
+    PASS("sealed-pool spend dummy: randomized ciphertext tolerated only for zero value, own address, real epk, no memo");
+}
+
 static void test_totals_overflow(void) {
+    /* 21,000,000 coins in zatoshi: nothing larger can exist on chain, and
+     * nothing larger may reach a UI callback. */
+    const uint64_t MAXM = 2100000000000000ull;
     OrchardSignerCtx* ctx = &g_ctx;
     uint8_t to[43], change[43], own[43];
     fx_addr_foreign(to);
@@ -638,8 +723,33 @@ static void test_totals_overflow(void) {
     fx_addr_own_default(own);
     OrchardSignerTotals t;
 
-    /* Two external outputs whose sum wraps. */
-    FxNote a = fx_note(to, UINT64_MAX - 5, NULL, 1);
+    /* A single output above the supply is refused when it is fed, whoever
+     * it pays: external, change, own address. */
+    {
+        const uint8_t* who[3] = {to, change, own};
+        const uint64_t vals[3] = {MAXM + 1, 5000000000000000000ull, UINT64_MAX};
+        uint8_t seed = 40;
+        for(int w = 0; w < 3; w++) {
+            for(int v = 0; v < 3; v++) {
+                FxNote x = fx_note(who[w], vals[v], NULL, seed);
+                open_session(ctx, 1, 0);
+                assert(feed_full(ctx, &x, seed) == SIGNER_ERR_VALUE_OVERFLOW);
+                assert_aborted(ctx);
+                seed++;
+            }
+        }
+    }
+
+    /* The boundary itself is fine. */
+    FxNote e = fx_note(to, MAXM, NULL, 4);
+    open_session(ctx, 1, 0);
+    assert(feed_full(ctx, &e, 4) == SIGNER_OK);
+    assert(orchard_signer_get_totals(ctx, &t) == SIGNER_OK);
+    assert(t.total_leaving == MAXM && t.fee == 0);
+    orchard_signer_reset(ctx);
+
+    /* Two external outputs, each legal, whose sum is not. */
+    FxNote a = fx_note(to, MAXM - 5, NULL, 1);
     FxNote b = fx_note(to, 6, NULL, 2);
     open_session(ctx, 2, 0);
     assert(feed_full(ctx, &a, 1) == SIGNER_OK);
@@ -649,29 +759,27 @@ static void test_totals_overflow(void) {
     assert_aborted(ctx);
 
     /* External sum fits, external + fee does not. */
-    FxNote c = fx_note(to, UINT64_MAX - 9999, NULL, 3);
+    FxNote c = fx_note(to, MAXM - 9999, NULL, 3);
     open_session(ctx, 1, 10000);
     assert(feed_full(ctx, &c, 3) == SIGNER_OK);
     assert(orchard_signer_get_totals(ctx, &t) == SIGNER_ERR_VALUE_OVERFLOW);
     assert_aborted(ctx);
-
-    /* The boundary itself is fine. */
-    FxNote e = fx_note(to, UINT64_MAX - 10000, NULL, 4);
+    FxNote c2 = fx_note(to, MAXM - 10000, NULL, 13);
     open_session(ctx, 1, 10000);
-    assert(feed_full(ctx, &e, 4) == SIGNER_OK);
+    assert(feed_full(ctx, &c2, 13) == SIGNER_OK);
     assert(orchard_signer_get_totals(ctx, &t) == SIGNER_OK);
-    assert(t.total_leaving == UINT64_MAX && t.fee == 10000);
+    assert(t.total_leaving == MAXM && t.fee == 10000);
     orchard_signer_reset(ctx);
 
-    /* Own outputs overflow too (they are reported, so they are checked). */
-    FxNote f = fx_note(change, UINT64_MAX, NULL, 5);
+    /* Own outputs are reported, so their sums are checked too. */
+    FxNote f = fx_note(change, MAXM, NULL, 5);
     FxNote g = fx_note(change, 1, NULL, 6);
     open_session(ctx, 2, 0);
     assert(feed_full(ctx, &f, 5) == SIGNER_OK);
     assert(feed_full(ctx, &g, 6) == SIGNER_OK);
     assert(orchard_signer_get_totals(ctx, &t) == SIGNER_ERR_VALUE_OVERFLOW);
     assert_aborted(ctx);
-    FxNote h = fx_note(own, UINT64_MAX, NULL, 7);
+    FxNote h = fx_note(own, MAXM, NULL, 7);
     FxNote k = fx_note(own, 1, NULL, 8);
     open_session(ctx, 2, 0);
     assert(feed_full(ctx, &h, 7) == SIGNER_OK);
@@ -681,18 +789,15 @@ static void test_totals_overflow(void) {
 
     /* A large own output next to a large external one is NOT an overflow:
      * the two are never added together. */
-    FxNote m = fx_note(change, UINT64_MAX, NULL, 9);
-    FxNote n = fx_note(to, UINT64_MAX - 1, NULL, 10);
+    FxNote m = fx_note(change, MAXM, NULL, 9);
+    FxNote n = fx_note(to, MAXM - 1, NULL, 10);
     open_session(ctx, 2, 1);
     assert(feed_full(ctx, &m, 9) == SIGNER_OK);
     assert(feed_full(ctx, &n, 10) == SIGNER_OK);
     assert(orchard_signer_get_totals(ctx, &t) == SIGNER_OK);
-    assert(t.own_internal == UINT64_MAX && t.total_leaving == UINT64_MAX);
+    assert(t.own_internal == MAXM && t.total_leaving == MAXM);
     orchard_signer_reset(ctx);
 
-    /* Value balances that wrap int64 when the two pools are added. Both
-     * pools need an action: the value balance of a pool without one is not
-     * accepted at all (test_unbound_value_balance). */
     {
         uint8_t meta[ZIP244_TX_META_V6_EXT_SIZE];
         OrchardSignerFvk fvk = fx_wallet_fvk();
@@ -700,20 +805,27 @@ static void test_totals_overflow(void) {
         FxNote zo = fx_note(change, 2, NULL, 12);
         zo.pool = ZIP244_POOL_ORCHARD;
 
-        fx_build_meta(meta, FX_BRANCH_NU6_3, INT64_MAX, 1);
-        orchard_signer_init(ctx, 1);
-        assert(orchard_signer_feed_meta(ctx, &fvk, meta, sizeof(meta), 2) == SIGNER_OK);
-        assert(feed_full(ctx, &z, 11) == SIGNER_OK);
-        assert(feed_full(ctx, &zo, 12) == SIGNER_OK);
-        assert(orchard_signer_get_totals(ctx, &t) == SIGNER_ERR_FEE_OVERFLOW);
-        assert_aborted(ctx);
+        /* A value balance beyond the supply, in either direction and in
+         * either pool, is refused with the TxMeta. */
+        const int64_t bad[4] = {INT64_MAX, INT64_MIN, (int64_t)MAXM + 1, -(int64_t)MAXM - 1};
+        for(int i = 0; i < 4; i++) {
+            fx_build_meta(meta, FX_BRANCH_NU6_3, bad[i], 1);
+            orchard_signer_init(ctx, 1);
+            assert(orchard_signer_feed_meta(ctx, &fvk, meta, sizeof(meta), 2) ==
+                   SIGNER_ERR_VALUE_OVERFLOW);
+            fx_build_meta(meta, FX_BRANCH_NU6_3, 1, bad[i]);
+            orchard_signer_init(ctx, 1);
+            assert(orchard_signer_feed_meta(ctx, &fvk, meta, sizeof(meta), 2) ==
+                   SIGNER_ERR_VALUE_OVERFLOW);
+        }
 
-        fx_build_meta(meta, FX_BRANCH_NU6_3, INT64_MIN, -1);
+        /* Two legal balances whose sum is a fee above the supply. */
+        fx_build_meta(meta, FX_BRANCH_NU6_3, (int64_t)MAXM, 1);
         orchard_signer_init(ctx, 1);
         assert(orchard_signer_feed_meta(ctx, &fvk, meta, sizeof(meta), 2) == SIGNER_OK);
         assert(feed_full(ctx, &z, 11) == SIGNER_OK);
         assert(feed_full(ctx, &zo, 12) == SIGNER_OK);
-        assert(orchard_signer_get_totals(ctx, &t) == SIGNER_ERR_FEE_OVERFLOW);
+        assert(orchard_signer_get_totals(ctx, &t) == SIGNER_ERR_VALUE_OVERFLOW);
         assert_aborted(ctx);
 
         /* Both pools contribute to the fee. */
@@ -734,7 +846,7 @@ static void test_totals_overflow(void) {
         assert(orchard_signer_get_totals(ctx, &t) == SIGNER_ERR_FEE_NEGATIVE);
         assert_aborted(ctx);
     }
-    PASS("totals: every sum checked (VALUE_OVERFLOW / FEE_OVERFLOW / FEE_NEGATIVE), boundary exact");
+    PASS("totals: nothing above MAX_MONEY is accepted or reported; sums checked; boundary exact");
 }
 
 static void test_totals_with_transparent(void) {
@@ -850,7 +962,8 @@ static void test_unbound_value_balance(void) {
     assert(feed_full(ctx, &chg, 2) == SIGNER_ERR_EMPTY_POOL_BALANCE);
     assert_aborted(ctx);
     /* Even the smallest lie, in either direction, in either pool. */
-    static const int64_t lies[] = {1, -1, INT64_MAX, INT64_MIN};
+    /* (bounded by the supply: larger balances are refused with the TxMeta) */
+    static const int64_t lies[] = {1, -1, 2100000000000000ll, -2100000000000000ll};
     for(size_t i = 0; i < 4; i++) {
         fx_build_meta(meta, FX_BRANCH_NU6_3, lies[i], real);
         orchard_signer_init(ctx, 1);
@@ -1082,6 +1195,7 @@ int main(void) {
     test_totals_overflow();
     test_totals_with_transparent();
     test_unbound_value_balance();
+    test_sealed_pool_spend_dummy();
     test_transparent_inputs_unsupported();
     test_network();
     test_ivks_wiped_on_every_exit();

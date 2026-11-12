@@ -291,8 +291,11 @@ typedef struct {
      * plaintext, or ORCHARD_SIGNER_MEMO_NONE. */
     uint8_t memo_slot;
     uint8_t ownership;       /* OrchardOutputOwnership; 0 = unclassified */
-    uint8_t enc_verified;    /* enc_ciphertext + epk recomputed and matched:
-                                1 for every record (verify() refuses 0) */
+    uint8_t enc_verified;    /* 1: enc_ciphertext + epk recomputed and
+                                matched. 2: the sealed-pool spend-paired
+                                dummy (zero value, own address, real epk,
+                                randomized enc_ciphertext) — see
+                                orchard_signer.c. verify() refuses 0. */
 } OrchardActionDisplay;
 
 /**
@@ -344,9 +347,13 @@ typedef struct {
     OrchardOutputOwnership ownership;  /* decided on-device */
     OrchardMemoStatus memo;            /* decided on-device */
     bool has_memo;                     /* == (memo == ORCHARD_MEMO_PRESENT) */
-    bool ciphertext_verified;          /* always true: kept for source
-                                          compatibility (the compact body that
-                                          made it false no longer exists) */
+    bool ciphertext_verified;          /* false only for the sealed-Orchard
+                                          spend-paired dummy output: zero
+                                          value, one of this wallet's own
+                                          addresses, expected epk, and an
+                                          enc_ciphertext the builder
+                                          randomized on purpose. Never shown
+                                          (review_required is false). */
     bool review_required;              /* false only for value == 0 and
                                           ORCHARD_MEMO_NONE */
     bool confirmed;

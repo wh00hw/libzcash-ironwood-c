@@ -386,20 +386,13 @@ __attribute__((noinline)) static void wallet_sequence(const secrets* s) {
         assert(orchard_signer_confirm_action(&s_signer, 0) == SIGNER_OK);
         assert(orchard_signer_confirm_totals(&s_signer) == SIGNER_OK);
         assert(orchard_signer_verify(&s_signer, w.sighash) == SIGNER_ERR_SIGHASH_MISMATCH);
-        /* non-empty transparent digest with no transparent pass */
+        /* non-empty transparent digest with no transparent pass: refused
+         * before anything is shown, at the totals */
         meta[102] ^= 1;
         RESIDUE_OPEN();
         assert(RESIDUE_FEED(dp, 12345) == SIGNER_OK);
-        assert(orchard_signer_get_totals(&s_signer, &totals) == SIGNER_OK);
-        assert(orchard_signer_confirm_action(&s_signer, 0) == SIGNER_OK);
-        assert(orchard_signer_confirm_totals(&s_signer) == SIGNER_OK);
-        {
-            Zip244ActionsState o = s_signer.actions_state, i = s_signer.ironwood_actions_state;
-            zip244_shielded_sighash_v6(&s_signer.tx_meta, &o, &i, sh);
-            memzero(&o, sizeof(o));
-            memzero(&i, sizeof(i));
-        }
-        assert(orchard_signer_verify(&s_signer, sh) == SIGNER_ERR_TRANSPARENT_NOT_EMPTY);
+        assert(orchard_signer_get_totals(&s_signer, &totals) ==
+               SIGNER_ERR_TRANSPARENT_NOT_EMPTY);
         meta[102] ^= 1;
         assert(s_signer.state == SIGNER_IDLE);
 

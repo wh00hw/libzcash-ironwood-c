@@ -8,6 +8,12 @@
 #include <stdint.h>
 #include <string.h>
 
+/* No amount above the total supply can exist on chain. Refusing such values
+ * at the door means no UI callback ever has to format one: a number too
+ * wide for a small screen must never be drawn truncated. */
+#define ORCHARD_MAX_MONEY 2100000000000000ull /* 21,000,000 coins, zatoshi */
+
+
 static bool signer_network_valid(uint32_t coin_type)
 {
     return coin_type == ORCHARD_SIGNER_COIN_MAINNET ||
@@ -126,6 +132,15 @@ OrchardSignerError orchard_signer_feed_meta(OrchardSignerCtx *ctx,
         (ctx->tx_meta.orchard_flags & ~0x03u) != 0 ||
         (ctx->tx_meta.ironwood_flags & ~0x07u) != 0) {
         return signer_meta_reject(ctx, SIGNER_ERR_BAD_META);
+    }
+
+    /* Value balances beyond the supply, in either direction. (INT64_MIN has
+     * no positive counterpart; the comparison below excludes it too.) */
+    if (ctx->tx_meta.value_balance > (int64_t)ORCHARD_MAX_MONEY ||
+        ctx->tx_meta.value_balance < -(int64_t)ORCHARD_MAX_MONEY ||
+        ctx->tx_meta.ironwood_value_balance > (int64_t)ORCHARD_MAX_MONEY ||
+        ctx->tx_meta.ironwood_value_balance < -(int64_t)ORCHARD_MAX_MONEY) {
+        return signer_meta_reject(ctx, SIGNER_ERR_VALUE_OVERFLOW);
     }
 
     /* Consensus branch gate: the branch ID goes into the sighash
@@ -254,6 +269,9 @@ OrchardSignerError orchard_signer_feed_transparent_output(OrchardSignerCtx *ctx,
     if ((size_t)10 + script_len != data_len ||
         !signer_script_is_standard(data + 10, script_len)) {
         return signer_abort(ctx, SIGNER_ERR_TRANSPARENT_BAD_OUTPUT);
+    }
+    if (value > ORCHARD_MAX_MONEY) {
+        return signer_abort(ctx, SIGNER_ERR_VALUE_OVERFLOW);
     }
     if (!zip244_hash_transparent_output(&ctx->transparent_state, data, data_len)) {
         return signer_abort(ctx, SIGNER_ERR_TRANSPARENT_BAD_OUTPUT);
@@ -458,6 +476,9 @@ OrchardSignerError orchard_signer_feed_action_with_note_and_memo(
      * the cmx field embedded in the action bytes. From here on recipient
      * and value are facts about the note, not claims. The note version
      * (and thus the rcm derivation) follows the action's pool. */
+    if (value > ORCHARD_MAX_MONEY) {
+        return signer_abort(ctx, SIGNER_ERR_VALUE_OVERFLOW);
+    }
     uint8_t computed_cmx[32];
     orchard_compute_cmx(d, pk_d, value, rho, rseed, note_version, computed_cmx);
     int cmx_ok = ct_memequal(computed_cmx, action_cmx, 32);
@@ -475,30 +496,55 @@ OrchardSignerError orchard_signer_feed_action_with_note_and_memo(
      * no re-entrancy. esk is derived internally from rseed + rho (shared by
      * ZIP-212 V2 and ZIP-2005 V3 notes); the plaintext lead byte follows
      * the pool's note version. */
+    int enc_ok, epk_ok;
     {
         static uint8_t computed_enc[ORCHARD_ACTION_ENC_SIZE];
         uint8_t computed_epk[32];
         int rc = orchard_compute_enc_ciphertext_from_rseed(
             d, pk_d, value, rseed, rho, memo, note_version,
             computed_enc, computed_epk);
-        /* Both checks must pass before anything is committed to the action
-         * stream; AND-accumulate so the timing shows only "both matched". */
-        int enc_ok = ct_memequal(computed_enc, action_enc, ORCHARD_ACTION_ENC_SIZE);
-        int epk_ok = ct_memequal(computed_epk, action_epk, 32);
+        enc_ok = ct_memequal(computed_enc, action_enc, ORCHARD_ACTION_ENC_SIZE);
+        epk_ok = ct_memequal(computed_epk, action_epk, 32);
         memzero(computed_enc, sizeof(computed_enc));
         memzero(computed_epk, sizeof(computed_epk));
         if (rc != 0) {
             /* pk_d is not a valid Pallas point. */
             return signer_abort(ctx, SIGNER_ERR_BAD_PK_D);
         }
-        if (!(enc_ok & epk_ok)) {
-            return signer_abort(ctx, SIGNER_ERR_MEMO_MISMATCH);
-        }
     }
 
     /* Step 3: ownership, from the device's own keys. g_d is served from the
      * diversifier cache filled by the cmx recomputation above. */
     uint8_t ownership = signer_classify(ctx, recipient);
+
+    /* One, narrow, exception to "every ciphertext matches". In the sealed
+     * Orchard pool cross-address transfers are disabled, so the builder
+     * pairs each real spend with a zero-value output addressed to the
+     * spent note's own receiver, and for external-scope spends it replaces
+     * that output's enc_ciphertext with random bytes on purpose, so that
+     * nobody holding the receiver's viewing key can detect the spend
+     * (orchard crate, OutputInfo::fabricated_for_spend). epk stays the
+     * real one. Without this exception no note received at an external
+     * address could ever leave the sealed pool.
+     *
+     * It applies only when ALL of the following hold, each established by
+     * the device: the action is in the sealed Orchard pool; the commitment
+     * just verified says the value is 0; the recipient is one of this
+     * wallet's own addresses; epk is the expected one; and the host
+     * declared no memo. Such an output moves no value, can only "deliver"
+     * its bytes to this wallet itself, and is never shown. Anything else
+     * with a ciphertext that does not match is refused as before. */
+    uint8_t enc_state = 1;
+    if (!(enc_ok & epk_ok)) {
+        bool own = ownership == (uint8_t)ORCHARD_OUTPUT_OWN_INTERNAL ||
+                   ownership == (uint8_t)ORCHARD_OUTPUT_OWN_EXTERNAL;
+        if (pool == ZIP244_POOL_ORCHARD && value == 0 && epk_ok && own &&
+            orchard_signer_memo_is_empty(memo)) {
+            enc_state = 2;
+        } else {
+            return signer_abort(ctx, SIGNER_ERR_MEMO_MISMATCH);
+        }
+    }
 
     /* Step 4: a memo the user has to read needs a slot. Empty memos were
      * verified above like any other but have nothing to show. A transaction
@@ -525,7 +571,7 @@ OrchardSignerError orchard_signer_feed_action_with_note_and_memo(
     memcpy(disp->recipient, recipient, 43);
     disp->value = value;
     disp->ownership = ownership;
-    disp->enc_verified = 1;
+    disp->enc_verified = enc_state;
     disp->memo_slot = memo_slot;
     disp->confirmed = (value == 0 && memo_slot == ORCHARD_SIGNER_MEMO_NONE);
     if (memo_slot != ORCHARD_SIGNER_MEMO_NONE) {
@@ -559,7 +605,7 @@ OrchardSignerError orchard_signer_get_output(
     out->ownership = (OrchardOutputOwnership)disp->ownership;
     out->has_memo = disp->memo_slot != ORCHARD_SIGNER_MEMO_NONE;
     out->memo = out->has_memo ? ORCHARD_MEMO_PRESENT : ORCHARD_MEMO_NONE;
-    out->ciphertext_verified = disp->enc_verified != 0;
+    out->ciphertext_verified = disp->enc_verified == 1;
     out->review_required = (disp->value != 0) || out->has_memo;
     out->confirmed = disp->confirmed;
     return SIGNER_OK;
@@ -675,6 +721,18 @@ OrchardSignerError orchard_signer_get_totals(OrchardSignerCtx *ctx,
         return SIGNER_ERR_BAD_STATE;
     }
 
+    /* Same rule verify() enforces, applied before anything is shown: with
+     * no transparent pass the transparent digest must be the empty-bundle
+     * constant. Otherwise the user would be walked through a review of a
+     * transaction the device is going to refuse. */
+    if (!ctx->transparent_verified) {
+        uint8_t transparent_empty[32];
+        zip244_empty_digest("ZTxIdTranspaHash", transparent_empty);
+        if (!ct_memequal(ctx->tx_meta.transparent_sig_digest, transparent_empty, 32)) {
+            return signer_abort(ctx, SIGNER_ERR_TRANSPARENT_NOT_EMPTY);
+        }
+    }
+
     OrchardSignerError ferr = signer_compute_fee(ctx);
     if (ferr != SIGNER_OK) {
         return ferr;
@@ -716,7 +774,13 @@ OrchardSignerError orchard_signer_get_totals(OrchardSignerCtx *ctx,
     ok &= add_u64_checked(&out->total_leaving, out->transparent_out);
     ok &= add_u64_checked(&out->total_leaving, out->fee);
 
-    if (!ok) {
+    if (!ok ||
+        out->fee > ORCHARD_MAX_MONEY ||
+        out->external_shielded > ORCHARD_MAX_MONEY ||
+        out->transparent_out > ORCHARD_MAX_MONEY ||
+        out->own_internal > ORCHARD_MAX_MONEY ||
+        out->own_external > ORCHARD_MAX_MONEY ||
+        out->total_leaving > ORCHARD_MAX_MONEY) {
         memset(out, 0, sizeof(*out));
         return signer_abort(ctx, SIGNER_ERR_VALUE_OVERFLOW);
     }
@@ -760,7 +824,8 @@ OrchardSignerError orchard_signer_verify(OrchardSignerCtx *ctx,
          * feed function), kept as the invariant's last line: an
          * unclassified or unverified output never reaches VERIFIED. */
         if (ctx->actions_display[i].ownership == 0 ||
-            ctx->actions_display[i].enc_verified != 1) {
+            (ctx->actions_display[i].enc_verified != 1 &&
+             ctx->actions_display[i].enc_verified != 2)) {
             return SIGNER_ERR_BAD_STATE;
         }
         if (!ctx->actions_display[i].confirmed) {
