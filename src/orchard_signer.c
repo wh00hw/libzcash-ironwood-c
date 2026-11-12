@@ -496,7 +496,7 @@ OrchardSignerError orchard_signer_feed_action_with_note_and_memo(
      * no re-entrancy. esk is derived internally from rseed + rho (shared by
      * ZIP-212 V2 and ZIP-2005 V3 notes); the plaintext lead byte follows
      * the pool's note version. */
-    int enc_ok, epk_ok;
+    int enc_ok, epk_ok, enc_prefix_differs;
     {
         static uint8_t computed_enc[ORCHARD_ACTION_ENC_SIZE];
         uint8_t computed_epk[32];
@@ -505,6 +505,11 @@ OrchardSignerError orchard_signer_feed_action_with_note_and_memo(
             computed_enc, computed_epk);
         enc_ok = ct_memequal(computed_enc, action_enc, ORCHARD_ACTION_ENC_SIZE);
         epk_ok = ct_memequal(computed_epk, action_epk, 32);
+        /* The first 52 bytes are the encrypted note fields (lead byte, d,
+         * value, rseed). ChaCha20 is a stream cipher, so ANY ciphertext a
+         * wallet would accept as this note — whatever its memo — has
+         * exactly this prefix. Used by the exception below. */
+        enc_prefix_differs = !ct_memequal(computed_enc, action_enc, 52);
         memzero(computed_enc, sizeof(computed_enc));
         memzero(computed_epk, sizeof(computed_epk));
         if (rc != 0) {
@@ -528,17 +533,29 @@ OrchardSignerError orchard_signer_feed_action_with_note_and_memo(
      * address could ever leave the sealed pool.
      *
      * It applies only when ALL of the following hold, each established by
-     * the device: the action is in the sealed Orchard pool; the commitment
-     * just verified says the value is 0; the recipient is one of this
-     * wallet's own addresses; epk is the expected one; and the host
-     * declared no memo. Such an output moves no value, can only "deliver"
-     * its bytes to this wallet itself, and is never shown. Anything else
-     * with a ciphertext that does not match is refused as before. */
+     * the device:
+     *   - the action is in the sealed Orchard pool;
+     *   - the commitment just verified says the value is 0;
+     *   - the recipient is one of this wallet's own EXTERNAL addresses
+     *     (the builder randomizes only for external-scope spends; an
+     *     internal-scope dummy keeps a real ciphertext and takes the
+     *     normal path);
+     *   - epk is the expected one;
+     *   - the host declared no memo;
+     *   - the ciphertext is NOT an encryption of this note: its first 52
+     *     bytes differ from the recomputed ones. Random bytes satisfy that
+     *     except with probability 2^-416; a real ciphertext carrying a
+     *     memo of the host's choice — which this wallet would later
+     *     decrypt and show in its history — does not.
+     * What remains is 580 bytes of host-chosen data on chain that no
+     * wallet, this one included, will decrypt as a note. It moves no
+     * value and is never shown. Anything else with a ciphertext that does
+     * not match is refused as before. */
     uint8_t enc_state = 1;
     if (!(enc_ok & epk_ok)) {
-        bool own = ownership == (uint8_t)ORCHARD_OUTPUT_OWN_INTERNAL ||
-                   ownership == (uint8_t)ORCHARD_OUTPUT_OWN_EXTERNAL;
-        if (pool == ZIP244_POOL_ORCHARD && value == 0 && epk_ok && own &&
+        if (pool == ZIP244_POOL_ORCHARD && value == 0 && epk_ok &&
+            enc_prefix_differs &&
+            ownership == (uint8_t)ORCHARD_OUTPUT_OWN_EXTERNAL &&
             orchard_signer_memo_is_empty(memo)) {
             enc_state = 2;
         } else {

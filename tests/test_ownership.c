@@ -651,22 +651,52 @@ static void test_sealed_pool_spend_dummy(void) {
     fx_addr_change(change);
     fx_addr_own_default(own);
 
-    /* Accepted: sealed Orchard pool, value 0, own address (external or
-     * internal), expected epk, no memo, ciphertext not the recomputed one. */
-    const uint8_t* mine[2] = {own, change};
-    for(int w = 0; w < 2; w++) {
-        FxNote dmy = fx_note(mine[w], 0, NULL, (uint8_t)(60 + w));
+    /* Accepted: sealed Orchard pool, value 0, own EXTERNAL address,
+     * expected epk, no memo, and a ciphertext that is not an encryption of
+     * the note (its 52-byte note-field prefix differs). */
+    {
+        FxNote dmy = fx_note(own, 0, NULL, 60);
         dmy.pool = ZIP244_POOL_ORCHARD;
         open_session(ctx, 1, 0);
-        assert(feed_tampered(ctx, &dmy, (uint8_t)(60 + w), 17, -1) == SIGNER_OK);
+        assert(feed_tampered(ctx, &dmy, 60, 17, -1) == SIGNER_OK);
         OrchardOutputInfo info = output(ctx, 0);
         assert(info.value == 0 && !info.review_required && !info.ciphertext_verified);
-        assert(info.ownership != ORCHARD_OUTPUT_EXTERNAL && info.memo == ORCHARD_MEMO_NONE);
+        assert(info.ownership == ORCHARD_OUTPUT_OWN_EXTERNAL && info.memo == ORCHARD_MEMO_NONE);
         orchard_signer_reset(ctx);
     }
 
     /* Refused, one condition removed at a time. */
     {
+        /* the wallet's own change (internal) address: the builder never
+         * randomizes there */
+        FxNote ci = fx_note(change, 0, NULL, 61);
+        ci.pool = ZIP244_POOL_ORCHARD;
+        open_session(ctx, 1, 0);
+        assert(feed_tampered(ctx, &ci, 61, 17, -1) == SIGNER_ERR_MEMO_MISMATCH);
+        assert_aborted(ctx);
+        /* a ciphertext that IS an encryption of the note, but of another
+         * memo than the (empty) one declared: only bytes past the 52-byte
+         * note prefix differ. This wallet would decrypt it and show a memo
+         * the user never reviewed. */
+        FxNote hid = fx_note(own, 0, NULL, 62);
+        hid.pool = ZIP244_POOL_ORCHARD;
+        open_session(ctx, 1, 0);
+        assert(feed_tampered(ctx, &hid, 62, 52, -1) == SIGNER_ERR_MEMO_MISMATCH);
+        assert_aborted(ctx);
+        open_session(ctx, 1, 0);
+        assert(feed_tampered(ctx, &hid, 62, 300, -1) == SIGNER_ERR_MEMO_MISMATCH);
+        assert_aborted(ctx);
+        open_session(ctx, 1, 0);
+        assert(feed_tampered(ctx, &hid, 62, 579, -1) == SIGNER_ERR_MEMO_MISMATCH);
+        assert_aborted(ctx);
+        /* ...while a difference inside the prefix is the randomized case */
+        open_session(ctx, 1, 0);
+        assert(feed_tampered(ctx, &hid, 62, 51, -1) == SIGNER_OK);
+        orchard_signer_reset(ctx);
+        open_session(ctx, 1, 0);
+        assert(feed_tampered(ctx, &hid, 62, 0, -1) == SIGNER_OK);
+        orchard_signer_reset(ctx);
+
         /* a foreign recipient */
         FxNote x = fx_note(to, 0, NULL, 70);
         x.pool = ZIP244_POOL_ORCHARD;
@@ -709,7 +739,7 @@ static void test_sealed_pool_spend_dummy(void) {
     assert(feed_full(ctx, &ok, 75) == SIGNER_OK);
     assert(output(ctx, 0).ciphertext_verified);
     orchard_signer_reset(ctx);
-    PASS("sealed-pool spend dummy: randomized ciphertext tolerated only for zero value, own address, real epk, no memo");
+    PASS("sealed-pool spend dummy: tolerated only for zero value, own external address, real epk, no memo, not an encryption of the note");
 }
 
 static void test_totals_overflow(void) {

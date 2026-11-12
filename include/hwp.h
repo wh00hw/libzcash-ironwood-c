@@ -59,7 +59,8 @@ _Static_assert(HWP_MAX_PAYLOAD >= 1420,
 //
 // The device uses recipient/value/rseed to recompute the action's note
 // commitment and, with the memo, its `enc_ciphertext` and `ephemeral_key`
-// byte-for-byte; a mismatch ends the session. `esk` is NOT on the wire: per
+// byte-for-byte; a mismatch ends the session (one exception, decided by the
+// device: the sealed-Orchard spend dummy, see orchard_signer.c). `esk` is NOT on the wire: per
 // ZIP-212 it is a deterministic function of rseed + rho (= the action's
 // nullifier), so the device derives it itself.
 //

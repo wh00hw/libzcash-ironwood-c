@@ -293,15 +293,20 @@ typedef struct {
     uint8_t ownership;       /* OrchardOutputOwnership; 0 = unclassified */
     uint8_t enc_verified;    /* 1: enc_ciphertext + epk recomputed and
                                 matched. 2: the sealed-pool spend-paired
-                                dummy (zero value, own address, real epk,
-                                randomized enc_ciphertext) — see
-                                orchard_signer.c. verify() refuses 0. */
+                                dummy (zero value, own external address,
+                                real epk, enc_ciphertext not an encryption
+                                of the note) — see orchard_signer.c.
+                                verify() refuses 0. */
 } OrchardActionDisplay;
 
 /**
  * What the device established about the memo of an output. There is no
- * "unknown": every output's ciphertext is recomputed, so the memo is always
- * known. 0 is not a member.
+ * "unknown" for an output that is shown: its ciphertext is recomputed and
+ * matched, so the memo is known. The sealed-pool spend dummy
+ * (ciphertext_verified == false, review_required == false) reports
+ * ORCHARD_MEMO_NONE as "nothing to read": its ciphertext is checked not to
+ * be an encryption of the note, so no wallet will decrypt a memo from it.
+ * 0 is not a member.
  */
 typedef enum {
     ORCHARD_MEMO_NONE    = 1,  /* verified to carry NO memo: the 512 bytes are
@@ -350,10 +355,12 @@ typedef struct {
     bool ciphertext_verified;          /* false only for the sealed-Orchard
                                           spend-paired dummy output: zero
                                           value, one of this wallet's own
-                                          addresses, expected epk, and an
-                                          enc_ciphertext the builder
-                                          randomized on purpose. Never shown
-                                          (review_required is false). */
+                                          external addresses, expected epk,
+                                          and an enc_ciphertext that is not
+                                          an encryption of the note (the
+                                          builder randomizes it on purpose).
+                                          Never shown (review_required is
+                                          false). */
     bool review_required;              /* false only for value == 0 and
                                           ORCHARD_MEMO_NONE */
     bool confirmed;

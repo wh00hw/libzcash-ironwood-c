@@ -490,7 +490,8 @@ static HWP_NOINLINE bool handle_tx_output(HwpDispatcher* d, HwpFrame* f) {
          * (0x00 = sealed Orchard, 0x01 = Ironwood) followed by the
          * memo-carrying body: 1416 bytes on the wire. The compact
          * (no-memo, 904 B) body is refused for every output — the device
-         * recomputes every ciphertext — and so is anything else, the
+         * recomputes every ciphertext (and matches all but the sealed-pool
+         * spend dummy's) — and so is anything else, the
          * untagged pre-v6 layouts included. */
         phase(d, HWP_PHASE_VERIFY,
               (uint16_t)(txo.output_index + 1), txo.total_outputs);

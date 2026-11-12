@@ -111,7 +111,9 @@ typedef enum {
 
 /* What the device established about an output's memo. 0 is not a member. */
 typedef enum {
-    HWP_MEMO_NONE           = 1, /* shielded output VERIFIED to carry no memo */
+    HWP_MEMO_NONE           = 1, /* shielded output VERIFIED to carry no memo
+                                    (never reported for the spend dummy,
+                                    which is not shown at all)             */
     HWP_MEMO_PRESENT        = 2, /* verified memo; review_memo() follows       */
     HWP_MEMO_NOT_APPLICABLE = 3, /* transparent output: there is no memo field */
 } HwpMemoStatus;
