@@ -75,6 +75,11 @@ target_include_directories(test_signer PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 target_compile_options(test_signer PRIVATE -UNDEBUG)
 add_test(NAME test_signer COMMAND test_signer)
 
+add_executable(test_bip39 test_bip39.c)
+target_link_libraries(test_bip39 PRIVATE zcash-ironwood-c-deterministic)
+target_compile_options(test_bip39 PRIVATE -UNDEBUG)
+add_test(NAME test_bip39 COMMAND test_bip39)
+
 add_executable(test_vectors test_vectors.c)
 target_link_libraries(test_vectors PRIVATE zcash-ironwood-c-deterministic)
 add_test(NAME test_vectors COMMAND test_vectors)
@@ -164,6 +169,8 @@ set(FLIPZ_TUNING_DEFS
     ORCHARD_SIGNER_MAX_ACTIONS=8
     ORCHARD_SIGNER_MAX_MEMOS=4
     HWP_MAX_PAYLOAD=1536
+    PALLAS_FIXED_BASE_COMB=0
+    PALLAS_POINT_MUL_WINDOW=2
     FLIPZ_TUNING
 )
 get_target_property(DETERMINISTIC_SOURCES zcash-ironwood-c-deterministic SOURCES)
@@ -177,6 +184,19 @@ target_compile_definitions(zcash-ironwood-c-flipz
     PUBLIC ${FLIPZ_TUNING_DEFS}
 )
 target_compile_options(zcash-ironwood-c-flipz PRIVATE -UNDEBUG -Wall -Wextra -Wno-unused-parameter)
+
+# The known-answer vectors and the signer/curve tests in the Flipper
+# configuration too: no comb table, 2-bit window.
+foreach(t test_vectors test_curve test_signer test_ironwood)
+    add_executable(${t}_flipz ${t}.c)
+    target_link_libraries(${t}_flipz PRIVATE zcash-ironwood-c-flipz)
+    target_include_directories(${t}_flipz PRIVATE ${CMAKE_SOURCE_DIR}/tests ${CMAKE_SOURCE_DIR}/src)
+    target_compile_options(${t}_flipz PRIVATE -UNDEBUG)
+endforeach()
+add_test(NAME test_vectors_flipz COMMAND test_vectors_flipz)
+add_test(NAME test_curve_flipz COMMAND test_curve_flipz)
+add_test(NAME test_signer_flipz COMMAND test_signer_flipz)
+add_test(NAME test_ironwood_flipz COMMAND test_ironwood_flipz)
 
 add_executable(test_ownership_flipz test_ownership.c)
 target_link_libraries(test_ownership_flipz PRIVATE zcash-ironwood-c-flipz)

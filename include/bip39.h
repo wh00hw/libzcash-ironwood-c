@@ -36,7 +36,8 @@
 void bip39_cache_clear(void);
 #endif
 
-extern const char* const BIP39_WORDLIST_ENGLISH[BIP39_WORD_COUNT];
+#define BIP39_WORD_MAX_LEN 8
+extern const char BIP39_WORDLIST_ENGLISH[BIP39_WORD_COUNT][BIP39_WORD_MAX_LEN + 1];
 
 const char* mnemonic_generate(int strength); // strength in bits
 const char* mnemonic_from_data(const uint8_t* data, int len);

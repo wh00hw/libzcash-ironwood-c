@@ -23,7 +23,11 @@
 
 #include "bip39.h"
 
-const char* const BIP39_WORDLIST_ENGLISH[BIP39_WORD_COUNT] = {
+/* Fixed-width rows rather than an array of pointers: the same strings, but
+ * no pointer table to relocate when the image is loaded into RAM (2048
+ * relocations on a Flipper Zero .fap). Every word fits in 8 characters,
+ * so each row keeps its NUL terminator (asserted by tests/test_bip39.c). */
+const char BIP39_WORDLIST_ENGLISH[BIP39_WORD_COUNT][BIP39_WORD_MAX_LEN + 1] = {
     "abandon",  "ability",  "able",     "about",    "above",    "absent",   "absorb",   "abstract",
     "absurd",   "abuse",    "access",   "accident", "account",  "accuse",   "achieve",  "acid",
     "acoustic", "acquire",  "across",   "act",      "action",   "actor",    "actress",  "actual",

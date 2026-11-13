@@ -110,7 +110,8 @@ void pallas_jac_add(pallas_jac* r, const pallas_jac* a, const pallas_jac* b);
 void pallas_jac_add_mixed(pallas_jac* r, const pallas_jac* p, const pallas_point* q);
 void pallas_point_mul(pallas_point* r, const bignum256* k, const pallas_point* p);
 
-// Fixed bases with a precomputed comb table (src/pallas_fixed_base_table.h).
+// Fixed bases. With PALLAS_FIXED_BASE_COMB=1 (default) each has a precomputed
+// comb table (src/pallas_fixed_base_table.h); with 0 there is no table.
 typedef enum {
     PALLAS_BASE_SPEND_AUTH_G = 0,  // hash_to_curve("z.cash:Orchard")("G")
     PALLAS_BASE_NOTE_COMMIT_R = 1, // hash_to_curve("z.cash:Orchard-NoteCommit-r")("")
@@ -119,7 +120,8 @@ typedef enum {
 } pallas_fixed_base;
 
 // r = [k]B for one of the fixed bases above; same result as
-// pallas_point_mul(r, k, B), constant-time in k, about twice as fast.
+// pallas_point_mul(r, k, B), constant-time in k. About twice as fast with the
+// comb table; with PALLAS_FIXED_BASE_COMB=0 it is pallas_point_mul itself.
 // k may be any value below 2^256. `base` is public; a value outside the
 // enum yields the point at infinity.
 void pallas_point_mul_fixed(pallas_point* r, const bignum256* k, pallas_fixed_base base);

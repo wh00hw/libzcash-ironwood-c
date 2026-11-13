@@ -1,7 +1,18 @@
 #include "pallas.h"
 #include "blake2b.h"
 #include "pallas_consts.h"
+/* PALLAS_FIXED_BASE_COMB: 1 (default) multiplies the three fixed bases with a
+ * precomputed comb table (src/pallas_fixed_base_table.h, 6.5 KB of rodata);
+ * 0 drops the table and routes pallas_point_mul_fixed() through the generic
+ * constant-time pallas_point_mul(), about half the speed for these
+ * multiplications. Same results either way. 0 is for targets where the
+ * table does not fit, e.g. a Flipper Zero .fap, which is loaded into RAM. */
+#ifndef PALLAS_FIXED_BASE_COMB
+#define PALLAS_FIXED_BASE_COMB 1
+#endif
+#if PALLAS_FIXED_BASE_COMB
 #include "pallas_fixed_base_table.h"
+#endif
 #include "pallas_sqrt_table.h"
 #include "memzero.h"
 #include <stdio.h>
@@ -1110,6 +1121,7 @@ void pallas_point_mul(pallas_point* r, const bignum256* k, const pallas_point* p
 //
 // The scalar may be any value below 2^256; it is not reduced mod q, the
 // comb simply multiplies by the integer.
+#if PALLAS_FIXED_BASE_COMB
 _Static_assert(PALLAS_COMB_TEETH * PALLAS_COMB_BLOCKS * PALLAS_COMB_SPACING == 256,
                "comb must cover 256 scalar bits");
 _Static_assert(PALLAS_COMB_BASES == PALLAS_FIXED_BASE_COUNT, "one comb table per fixed base");
@@ -1192,6 +1204,29 @@ void pallas_point_mul_fixed(pallas_point* r, const bignum256* k, pallas_fixed_ba
     want_v = 0;
     keep_v = 0;
 }
+#else /* !PALLAS_FIXED_BASE_COMB */
+
+/* No table: the generic constant-time multiplication by the base point
+ * (pallas_consts.h, checked by pallas_verify_fixed_points()). Same result
+ * as the comb for every k below 2^256. */
+void pallas_point_mul_fixed(pallas_point* r, const bignum256* k, pallas_fixed_base base) {
+    static const uint8_t idx[PALLAS_FIXED_BASE_COUNT] = {
+        [PALLAS_BASE_SPEND_AUTH_G] = 4,  /* "z.cash:Orchard", "G" */
+        [PALLAS_BASE_NOTE_COMMIT_R] = 1, /* "z.cash:Orchard-NoteCommit-r" */
+        [PALLAS_BASE_COMMIT_IVK_R] = 3,  /* "z.cash:Orchard-CommitIvk-r" */
+    };
+    if((unsigned)base >= PALLAS_FIXED_BASE_COUNT) {
+        pallas_point_set_infinity(r);
+        return;
+    }
+    const pallas_fixed_point* fp = &PALLAS_FIXED_POINTS[idx[(unsigned)base]];
+    pallas_point b;
+    bn_read_le(fp->xy, &b.x);
+    bn_read_le(fp->xy + 32, &b.y);
+    b.infinity = 0;
+    pallas_point_mul(r, k, &b);
+}
+#endif /* PALLAS_FIXED_BASE_COMB */
 
 // ============================================================
 // Hash-to-curve: simplified SWU + 3-isogeny
@@ -1511,6 +1546,7 @@ void pallas_hash_to_curve(pallas_point* r, const char* domain, const uint8_t* ms
     hash_to_curve_compute(r, domain, msg, msg_len);
 }
 
+#if PALLAS_FIXED_BASE_COMB
 /* Which hash-to-curve output each comb table belongs to, in
  * pallas_fixed_base order. */
 static const struct {
@@ -1563,6 +1599,7 @@ static int fixed_base_table_diff(unsigned base) {
     memzero(sum, sizeof(*sum));
     return diff;
 }
+#endif /* PALLAS_FIXED_BASE_COMB */
 
 bool pallas_verify_fixed_points(void) {
     int diff = 0;
@@ -1575,9 +1612,11 @@ bool pallas_verify_fixed_points(void) {
         bn_write_le(&p.y, xy + 32);
         for(int j = 0; j < 64; j++) diff |= xy[j] ^ fp->xy[j];
     }
+#if PALLAS_FIXED_BASE_COMB
     for(unsigned b = 0; b < PALLAS_FIXED_BASE_COUNT; b++) {
         diff |= fixed_base_table_diff(b);
     }
+#endif
     return diff == 0;
 }
 
