@@ -62,7 +62,7 @@ This library provides **cryptographic primitives**, not a complete hardware wall
 | Platform | Signing isolation | Key storage | Threat model |
 |----------|-------------------|-------------|--------------|
 | Flipper Zero | Physical buttons + display | SD card, PIN-sealed; no secure element | Reference firmware, not for real funds |
-| Ledger / Trezor | Secure element + display confirmation | Secure enclave | Full hardware wallet |
+| Device with a secure element | Display + buttons driven by the secure environment | Secure element | Depends on the product; not evaluated here |
 | ESP32-S2 dev board | None — software only | Flash, extractable via JTAG | Development / prototyping **only** |
 | STM32 bare metal | Depends on integration | Depends on MPU / TrustZone config | Varies |
 

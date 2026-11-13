@@ -2,6 +2,8 @@
 
 This document states, for audit reviewers: which host-supplied data the signature binds and which it does not; which secret-dependent operations are constant-time, by what technique and how that was checked; and what is and is not wiped. It describes the Orchard/Ironwood signing path. Transparent inputs are not supported (README, "Transparent inputs are not supported").
 
+> **About the "audit" labels.** Identifiers such as `C-1`, `H-3`, `M-5` or `M1` that appear in this document, in the README and in commit messages refer to findings of the project's own internal reviews (April–May 2026 and November 2026, done by the author with AI tooling). **This library has not had a third-party security audit.**
+
 ## Threat model
 
 The library runs on single-core embedded MCUs (Cortex-M4, ESP32, Flipper Zero) with 4 KB stack budgets. The attacker model is:
